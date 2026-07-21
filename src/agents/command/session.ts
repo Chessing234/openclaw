@@ -269,7 +269,7 @@ export function resolveSessionKeyForRequest(opts: {
       canonicalKey: sessionKey,
       defaultAgentId,
     });
-    if (compat) {
+    if (compat?.storePath === storePath) {
       sessionStore[sessionKey] = structuredClone(compat.entry);
     }
   }
