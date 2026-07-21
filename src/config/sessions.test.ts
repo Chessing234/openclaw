@@ -13,7 +13,7 @@ import {
   resolveSessionFilePathOptions,
   resolveSessionKey,
   resolveSessionTranscriptPath,
-  resolveSessionTranscriptsDir,
+  resolveSessionTranscriptsDirForAgent,
   updateSessionStore,
 } from "./sessions.js";
 
@@ -200,7 +200,7 @@ describe("sessions", () => {
 
   for (const testCase of resolveSessionKeyCases) {
     it(testCase.name, () => {
-      expect(resolveSessionKey(testCase.scope, testCase.ctx, testCase.mainKey)).toBe(
+      expect(resolveSessionKey(testCase.scope, testCase.ctx, testCase.mainKey, "main")).toBe(
         testCase.expected,
       );
     });
@@ -329,7 +329,8 @@ describe("sessions", () => {
   });
 
   it("derives session transcripts dir from OPENCLAW_STATE_DIR", () => {
-    const dir = resolveSessionTranscriptsDir(
+    const dir = resolveSessionTranscriptsDirForAgent(
+      "main",
       { OPENCLAW_STATE_DIR: "/custom/state" } as NodeJS.ProcessEnv,
       () => "/home/ignored",
     );

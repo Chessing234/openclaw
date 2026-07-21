@@ -1,12 +1,7 @@
 import path from "node:path";
 import { getNodeSqliteKysely } from "../../infra/kysely-sync.js";
 import { getChildLogger } from "../../logging/logger.js";
-import {
-  DEFAULT_AGENT_ID,
-  normalizeAgentId,
-  parseAgentSessionKey,
-  resolveAgentIdFromSessionKey,
-} from "../../routing/session-key.js";
+import { normalizeAgentId, parseAgentSessionKey } from "../../routing/session-key.js";
 import { runQueuedStoreWrite, type StoreWriterQueue } from "../../shared/store-writer-queue.js";
 import type { DB as OpenClawAgentKyselyDatabase } from "../../state/openclaw-agent-db.generated.js";
 import {
@@ -185,11 +180,14 @@ function resolveSqliteAgentId(params: {
       `SQLite session store path belongs to agent ${params.storeAgentId}; requested agent ${scopedAgentId}.`,
     );
   }
-  const resolved =
-    scopedAgentId ??
-    params.storeAgentId ??
-    (params.sessionKey !== undefined ? resolveAgentIdFromSessionKey(params.sessionKey) : undefined);
-  return resolved ?? (params.useDefaultAgentForUnownedStore ? DEFAULT_AGENT_ID : undefined);
+  const parsedAgentId = params.sessionKey
+    ? parseAgentSessionKey(params.sessionKey)?.agentId
+    : undefined;
+  const resolved = scopedAgentId ?? params.storeAgentId ?? parsedAgentId;
+  if (!resolved && params.useDefaultAgentForUnownedStore) {
+    throw new Error("Unowned SQLite session store requires an explicit configured agent id.");
+  }
+  return resolved;
 }
 
 export function resolveSqliteTranscriptArchiveDirectory(

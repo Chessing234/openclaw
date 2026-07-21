@@ -14,7 +14,10 @@ import {
   AgentDeletionCommitUncertainError,
   isAgentDeletionBlocked,
 } from "../agents/agent-lifecycle-registry.js";
-import { DEFAULT_AGENT_ID, normalizeAgentId } from "../routing/session-key.js";
+import {
+  LEGACY_IMPLICIT_AGENT_ID as DEFAULT_AGENT_ID,
+  normalizeAgentId,
+} from "../routing/session-key.js";
 import { resolveGlobalMap } from "../shared/global-singleton.js";
 import { getFileLockProcessStartTime } from "../shared/pid-alive.js";
 import type { CommandExplanationSummary } from "./command-analysis/explain.js";
@@ -1761,10 +1764,7 @@ export function resolveExecApprovalsFromFile(params: {
   const rawFile = params.file;
   const file = normalizeExecApprovals(params.file);
   const defaults = file.defaults ?? {};
-  const agentKey = params.agentId;
-  if (!agentKey) {
-    throw new Error("Exec approvals resolution requires an explicit agent id.");
-  }
+  const agentKey = params.agentId ?? "default";
   const agent = file.agents?.[agentKey] ?? {};
   const wildcard = file.agents?.["*"] ?? {};
   const rawAgent = rawFile.agents?.[agentKey] ?? {};
@@ -2317,7 +2317,10 @@ function applyRecordedAllowlistMetadata(params: {
   if (keys.size === 0) {
     return null;
   }
-  const target = params.agentId ?? DEFAULT_AGENT_ID;
+  if (!params.agentId) {
+    throw new Error("Exec allowlist metadata update requires an explicit agent id.");
+  }
+  const target = params.agentId;
   const agents = params.file.agents ?? {};
   let changed = false;
   const nextAgents = { ...agents };
@@ -2412,7 +2415,10 @@ function applyAllowlistEntryUpdate(params: {
     source?: ExecAllowlistEntry["source"];
   };
 }): ExecApprovalsFile | null {
-  const target = params.agentId ?? DEFAULT_AGENT_ID;
+  if (!params.agentId) {
+    throw new Error("Exec allowlist update requires an explicit agent id.");
+  }
+  const target = params.agentId;
   const agents = params.file.agents ?? {};
   const existing = agents[target] ?? {};
   const allowlist = Array.isArray(existing.allowlist) ? existing.allowlist : [];
