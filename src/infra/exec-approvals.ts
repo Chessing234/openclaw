@@ -1761,7 +1761,10 @@ export function resolveExecApprovalsFromFile(params: {
   const rawFile = params.file;
   const file = normalizeExecApprovals(params.file);
   const defaults = file.defaults ?? {};
-  const agentKey = params.agentId ?? DEFAULT_AGENT_ID;
+  const agentKey = params.agentId;
+  if (!agentKey) {
+    throw new Error("Exec approvals resolution requires an explicit agent id.");
+  }
   const agent = file.agents?.[agentKey] ?? {};
   const wildcard = file.agents?.["*"] ?? {};
   const rawAgent = rawFile.agents?.[agentKey] ?? {};

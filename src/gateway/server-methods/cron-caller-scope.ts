@@ -1,5 +1,5 @@
 import type { CronJob, CronJobCreate, CronJobPatch } from "../../cron/types.js";
-import { DEFAULT_AGENT_ID, normalizeAgentId } from "../../routing/session-key.js";
+import { normalizeAgentId } from "../../routing/session-key.js";
 import { parseAgentSessionKey } from "../../sessions/session-key-utils.js";
 import type { GatewayClient } from "./types.js";
 
@@ -23,8 +23,15 @@ export function readCronCallerScope(
   };
 }
 
-function resolveCronJobEffectiveAgentId(job: CronJob, defaultAgentId?: string): string {
-  return normalizeAgentId(job.agentId ?? defaultAgentId ?? DEFAULT_AGENT_ID);
+function resolveCronJobEffectiveAgentId(
+  job: { agentId?: string },
+  defaultAgentId?: string,
+): string {
+  const agentId = job.agentId ?? defaultAgentId;
+  if (!agentId) {
+    throw new Error("Cron job has no agent id and no configured default was provided.");
+  }
+  return normalizeAgentId(agentId);
 }
 
 function parseAgentIdFromSessionRef(value: string | undefined | null): string | undefined {
@@ -105,15 +112,14 @@ export function cronJobMatchesDeclarationScope(params: {
   if (inputOwnerSessionKey && !inputOwnerAgentId) {
     return params.job.owner?.sessionKey === inputOwnerSessionKey;
   }
-  const inputAgentId = normalizeAgentId(
-    inputOwnerAgentId ?? params.input.agentId ?? params.defaultAgentId ?? DEFAULT_AGENT_ID,
-  );
-  const jobAgentId = normalizeAgentId(
-    resolveCronJobOwnerAgentId(params.job) ??
-      params.job.agentId ??
-      params.defaultAgentId ??
-      DEFAULT_AGENT_ID,
-  );
+  const inputAgentIdRaw = inputOwnerAgentId ?? params.input.agentId ?? params.defaultAgentId;
+  const jobAgentIdRaw =
+    resolveCronJobOwnerAgentId(params.job) ?? params.job.agentId ?? params.defaultAgentId;
+  if (!inputAgentIdRaw || !jobAgentIdRaw) {
+    throw new Error("Cron declaration has no agent id and no configured default was provided.");
+  }
+  const inputAgentId = normalizeAgentId(inputAgentIdRaw);
+  const jobAgentId = normalizeAgentId(jobAgentIdRaw);
   return jobAgentId === inputAgentId;
 }
 
@@ -125,9 +131,7 @@ export function cronCreateMatchesCallerScope(params: {
   if (!params.callerScope) {
     return true;
   }
-  const effectiveAgentId = normalizeAgentId(
-    params.job.agentId ?? params.defaultAgentId ?? DEFAULT_AGENT_ID,
-  );
+  const effectiveAgentId = resolveCronJobEffectiveAgentId(params.job, params.defaultAgentId);
   if (effectiveAgentId !== params.callerScope.agentId) {
     return false;
   }
