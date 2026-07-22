@@ -253,6 +253,7 @@ export function createMockCronStateForJobs(params: {
     deps: {
       storePath: "/mock/path",
       cronEnabled: true,
+      defaultAgentId: "main",
       nowMs: () => nowMs,
       enqueueSystemEvent: () => {},
       requestHeartbeat: () => {},
