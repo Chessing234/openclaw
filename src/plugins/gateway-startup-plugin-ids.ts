@@ -10,6 +10,7 @@ import {
 } from "@openclaw/model-catalog-core/provider-id";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
+import { listAgentEntries } from "../agents/agent-scope-config.js";
 import { collectConfiguredAgentHarnessRuntimes } from "../agents/harness-runtimes.js";
 import { splitTrailingAuthProfile } from "../agents/model-ref-profile.js";
 import {
@@ -502,8 +503,7 @@ function collectConfiguredAgentModelProviderIds(
   addModelProviderRefs(defaults?.utilityModel);
   addModelMapProviderIds(defaults?.models);
 
-  const agents = Array.isArray(config.agents?.list) ? config.agents.list : [];
-  for (const agent of agents) {
+  for (const agent of listAgentEntries(config)) {
     if (!isRecord(agent)) {
       continue;
     }
@@ -722,8 +722,7 @@ export function collectConfiguredMemoryEmbeddingStartupProviderOwners(
     }
   };
   addEffectiveProviders(undefined);
-  const agents = config.agents?.list;
-  const agentEntries = Array.isArray(agents) ? agents.filter(isRecord) : [];
+  const agentEntries = listAgentEntries(config);
   if (agentEntries.length === 0) {
     return [...byConfiguredIdAndSource.values()];
   }
@@ -865,10 +864,8 @@ function collectValidationHeartbeatTargetChannelIds(config: OpenClawConfig): str
     channelIds.push(normalized);
   };
   pushTarget(config.agents?.defaults?.heartbeat?.target);
-  if (Array.isArray(config.agents?.list)) {
-    for (const agent of config.agents.list) {
-      pushTarget(agent?.heartbeat?.target);
-    }
+  for (const agent of listAgentEntries(config)) {
+    pushTarget(agent?.heartbeat?.target);
   }
   return sortUniquePluginIds(channelIds);
 }

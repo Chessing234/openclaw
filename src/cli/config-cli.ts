@@ -11,6 +11,11 @@ import type { Command } from "commander";
 import JSON5 from "json5";
 import { formatDocsLink } from "../../packages/terminal-core/src/links.js";
 import { theme } from "../../packages/terminal-core/src/theme.js";
+import {
+  listAgentEntries,
+  readAgentRosterProperty,
+  toAgentEntriesRecord,
+} from "../agents/agent-scope-config.js";
 import { normalizeConfiguredProviderCatalogModelId } from "../agents/model-ref-shared.js";
 import {
   type ConfigFileSnapshot,
@@ -238,7 +243,8 @@ function normalizeModelProviderRefsForConfigMutation(
 
 function normalizeConfigMutationModelRefs(cfg: OpenClawConfig): OpenClawConfig {
   const defaults = cfg.agents?.defaults;
-  const agentList = cfg.agents?.list;
+  const agentList = listAgentEntries(cfg);
+  const roster = readAgentRosterProperty(cfg);
   const providers = cfg.models?.providers;
   const normalizedAgentList = normalizeAgentListModelRefsForConfigMutation(agentList);
   const normalizedProviders = normalizeModelProviderRefsForConfigMutation(providers) as
@@ -268,9 +274,11 @@ function normalizeConfigMutationModelRefs(cfg: OpenClawConfig): OpenClawConfig {
                   },
                 }
               : undefined),
-            ...(normalizedAgentList !== agentList
-              ? { list: normalizedAgentList as typeof agentList }
-              : undefined),
+            ...(normalizedAgentList !== agentList && roster?.kind === "entries"
+              ? { entries: toAgentEntriesRecord(normalizedAgentList as typeof agentList) }
+              : normalizedAgentList !== agentList && roster?.kind === "list"
+                ? { list: normalizedAgentList as typeof agentList }
+                : undefined),
           },
         }
       : undefined),

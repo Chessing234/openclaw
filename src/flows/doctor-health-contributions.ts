@@ -1,6 +1,7 @@
 // Doctor health contribution helpers collect health checks from plugin manifests.
 import fs from "node:fs";
 import nodePath from "node:path";
+import { listAgentEntries } from "../agents/agent-scope-config.js";
 import { isExperimentalClawsEnabled } from "../claws/experimental.js";
 import type { probeGatewayMemoryStatus } from "../commands/doctor-gateway-health.js";
 import type { DoctorOptions, DoctorPrompter } from "../commands/doctor-prompter.js";
@@ -865,7 +866,7 @@ async function collectToolResultCapFindings(
       target: "agents.defaults",
     });
   }
-  for (const entry of cfg.agents?.list ?? []) {
+  for (const entry of listAgentEntries(cfg)) {
     const normalizedAgentId = normalizeAgentId(entry.id);
     if (
       !normalizedAgentId ||
@@ -966,7 +967,7 @@ async function runToolResultCapHealth(ctx: DoctorHealthFlowContext): Promise<voi
       scopeLabel: "defaults",
     });
   }
-  for (const entry of ctx.cfg.agents?.list ?? []) {
+  for (const entry of listAgentEntries(ctx.cfg)) {
     const normalizedAgentId = normalizeAgentId(entry.id);
     if (
       !normalizedAgentId ||

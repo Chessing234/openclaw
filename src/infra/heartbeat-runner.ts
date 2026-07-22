@@ -14,6 +14,7 @@ import {
 } from "openclaw/plugin-sdk/reply-payload";
 import {
   listAgentIds,
+  listAgentEntries,
   resolveAgentConfig,
   resolveAgentWorkspaceDir,
   resolveDefaultAgentId,
@@ -333,7 +334,7 @@ export function resolveHeartbeatSchedulerSeed(explicitSeed?: string) {
 }
 
 function hasExplicitHeartbeatAgents(cfg: OpenClawConfig) {
-  const list = cfg.agents?.list ?? [];
+  const list = listAgentEntries(cfg);
   return list.some((entry) => Boolean(entry?.heartbeat));
 }
 
@@ -381,7 +382,7 @@ function resolveHeartbeatForWake(params: {
 }
 
 export function resolveHeartbeatAgents(cfg: OpenClawConfig): HeartbeatAgent[] {
-  const list = cfg.agents?.list ?? [];
+  const list = listAgentEntries(cfg);
   if (hasExplicitHeartbeatAgents(cfg)) {
     return list
       .filter((entry) => entry?.heartbeat)
