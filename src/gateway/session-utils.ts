@@ -92,7 +92,6 @@ import {
   type SessionStoreTarget,
   type SessionScope,
 } from "../config/sessions.js";
-import { readUnresolvedLegacyMainSessionCompat } from "../config/sessions/legacy-main-session-key-migration.js";
 import {
   listSessionEntries as listAccessorSessionEntries,
   listSessionEntriesReadOnly as listAccessorSessionEntriesReadOnly,
@@ -1555,16 +1554,6 @@ export function resolveGatewaySessionStoreTargetWithStore(params: {
     readOnly: params.readOnly,
     initialStore: params.store,
   });
-  // Compat reads exist only while the recorded migration state is unresolved.
-  // Remove this exact-key bridge after the unresolved claim is resolved or discarded.
-  const compat = readUnresolvedLegacyMainSessionCompat({
-    canonicalKey,
-    defaultAgentId: agentId,
-  });
-  if (compat?.storePath === storePath && !store[canonicalKey]) {
-    store[canonicalKey] = structuredClone(compat.entry);
-  }
-
   if (canonicalKey === "global" || canonicalKey === "unknown") {
     const storeKeys = key && key !== canonicalKey ? [canonicalKey, key] : [key];
     return { agentId, storePath, canonicalKey, storeKeys, store };
