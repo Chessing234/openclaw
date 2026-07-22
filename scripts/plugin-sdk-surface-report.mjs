@@ -138,7 +138,8 @@ export function readPluginSdkSurfaceBudgets(env = process.env) {
     publicEntrypoints: readPluginSdkSurfaceBudgetEnv(
       "OPENCLAW_PLUGIN_SDK_MAX_PUBLIC_ENTRYPOINTS",
       // +1: session-discussion binds one external discussion provider to sessions.
-      140,
+      // +1: number-runtime is shared by official external plugin packages.
+      141,
       env,
     ),
     publicExports: readPluginSdkSurfaceBudgetEnv(
@@ -152,7 +153,8 @@ export function readPluginSdkSurfaceBudgets(env = process.env) {
       // +2: generic inbound-root and SCP-host schema validators.
       // +2: attributed-range renderer and its options contract.
       // +1: agent-harness transcript visibility projector.
-      4690,
+      // +33: public numeric coercion, timer bound, and timestamp helpers.
+      4723,
       env,
     ),
     publicFunctionExports: readPluginSdkSurfaceBudgetEnv(
@@ -166,7 +168,8 @@ export function readPluginSdkSurfaceBudgets(env = process.env) {
       // +2: generic inbound-root and SCP-host schema validators.
       // +1: attributed-range renderer.
       // +1: agent-harness transcript visibility projector.
-      2840,
+      // +29: public numeric coercion, timer bound, and timestamp helpers.
+      2869,
       env,
     ),
     publicDeprecatedExports: readPluginSdkSurfaceBudgetEnv(
