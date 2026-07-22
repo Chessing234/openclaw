@@ -606,6 +606,7 @@ export function buildGatewayCronService(params: {
               state,
               streamBatch,
               toolsAllow: job.payload.toolsAllow,
+              ownerSessionKey: job.owner?.sessionKey,
               abortSignal,
             }),
         }
@@ -829,6 +830,7 @@ export function buildGatewayCronService(params: {
         state: job.state.triggerState,
         streamBatch,
         toolsAllow: job.payload.toolsAllow,
+        ownerSessionKey: job.owner?.sessionKey,
         timeoutSeconds: job.payload.timeoutSeconds,
         toolBudget: job.payload.toolBudget,
         abortSignal,
