@@ -4059,6 +4059,7 @@ export const en: TranslationMap = {
       openInCanvas: "Open in canvas",
       reply: "Reply",
       replyToMessage: "Reply to message",
+      replyingTo: "Replying to {name}",
       rewind: "Rewind",
       rewindConfirm: "Rewind to before this message?",
       rewindToHere: "Rewind to here",
