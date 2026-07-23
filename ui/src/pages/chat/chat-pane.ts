@@ -572,7 +572,7 @@ class ChatPane extends OpenClawLightDomElement {
       !state?.connected ||
       !client ||
       this.connectedClient !== client ||
-      !context.gateway.snapshot.connected ||
+      context.gateway.snapshot.phase !== "connected" ||
       context.gateway.snapshot.client !== client
     ) {
       return null;
@@ -595,7 +595,7 @@ class ChatPane extends OpenClawLightDomElement {
       scope.state.connected &&
       scope.state.client === scope.client &&
       this.connectedClient === scope.client &&
-      scope.context.gateway.snapshot.connected &&
+      scope.context.gateway.snapshot.phase === "connected" &&
       scope.context.gateway.snapshot.client === scope.client &&
       this.connectionGeneration === scope.generation
     );
@@ -1627,7 +1627,7 @@ class ChatPane extends OpenClawLightDomElement {
           ...acquireBoardProviderForSession(
             key,
             client,
-            gateway.connected,
+            gateway.phase === "connected",
             canPinWidgets,
             canPinMcpApps,
             canMutate,
@@ -1640,7 +1640,7 @@ class ChatPane extends OpenClawLightDomElement {
           key,
           client,
           true,
-          gateway.connected,
+          gateway.phase === "connected",
           canPinWidgets,
           canPinMcpApps,
           canMutate,
@@ -1654,7 +1654,7 @@ class ChatPane extends OpenClawLightDomElement {
       sessionKey,
       client,
       available,
-      gateway?.connected ?? false,
+      gateway?.phase === "connected",
       canPinWidgets,
       canPinMcpApps,
       canMutate,
@@ -1672,7 +1672,12 @@ class ChatPane extends OpenClawLightDomElement {
     const enabled = isWorkboardEnabledInConfigSnapshot(
       this.context?.runtimeConfig?.state.configSnapshot,
     );
-    if (!board.hasBoard || board.face !== "dashboard" || !enabled || !gateway?.connected) {
+    if (
+      !board.hasBoard ||
+      board.face !== "dashboard" ||
+      !enabled ||
+      gateway?.phase !== "connected"
+    ) {
       return null;
     }
     const client = gateway.client;
@@ -2022,7 +2027,7 @@ class ChatPane extends OpenClawLightDomElement {
       state.connected &&
       this.connectedClient === client &&
       context.gateway.snapshot.client === client &&
-      context.gateway.snapshot.connected &&
+      context.gateway.snapshot.phase === "connected" &&
       this.connectionGeneration === connectionGeneration;
     if (!canCreateChatSession(state)) {
       state.lastError = NEW_SESSION_ACTIVE_RUN_MESSAGE;
@@ -2607,7 +2612,8 @@ class ChatPane extends OpenClawLightDomElement {
       return;
     }
     const wasConnected = state.connected;
-    const sourceChanged = state.client !== snapshot.client || wasConnected !== snapshot.connected;
+    const sourceChanged =
+      state.client !== snapshot.client || wasConnected !== (snapshot.phase === "connected");
     const clientChanged = this.connectedClient !== snapshot.client;
     if (sourceChanged) {
       // A reconnect can retain the browser client. Keep async ownership tied
@@ -2624,7 +2630,7 @@ class ChatPane extends OpenClawLightDomElement {
       state.chatLoading = false;
     }
     state.client = snapshot.client;
-    state.connected = snapshot.connected;
+    state.connected = snapshot.phase === "connected";
     state.connectionEpoch = this.connectionGeneration;
     state.hello = snapshot.hello;
     if (sourceChanged && state.sidebarContent?.kind === "session-discussion") {
@@ -2633,7 +2639,7 @@ class ChatPane extends OpenClawLightDomElement {
       // re-probe below restores the action for the new source.
       state.handleCloseSidebar();
     }
-    if (sourceChanged && snapshot.connected && state.sessionKey) {
+    if (sourceChanged && snapshot.phase === "connected" && state.sessionKey) {
       // Reconnects clear the probed states above; re-probe the active session
       // so source-owned affordances reappear without a manual session switch.
       void this.probeSessionDiscussion(state.sessionKey);
@@ -2643,11 +2649,11 @@ class ChatPane extends OpenClawLightDomElement {
     }
     state.terminalAvailable =
       this.context.config.current.terminalEnabled &&
-      snapshot.connected &&
+      snapshot.phase === "connected" &&
       hasOperatorAdminAccess(snapshot.hello?.auth ?? null) &&
       isGatewayMethodAdvertised(snapshot, "terminal.open") === true;
     state.browserPanelAvailable =
-      snapshot.connected &&
+      snapshot.phase === "connected" &&
       hasOperatorAdminAccess(snapshot.hello?.auth ?? null) &&
       isGatewayMethodAdvertised(snapshot, "browser.request") === true;
     state.assistantAgentId = snapshot.assistantAgentId;
@@ -2671,7 +2677,7 @@ class ChatPane extends OpenClawLightDomElement {
       }
     }
     state.assistantName = this.context.config.current.assistantIdentity.name;
-    if (!snapshot.connected) {
+    if (snapshot.phase !== "connected") {
       if (wasConnected) {
         const currentSessionId =
           typeof state.currentSessionId === "string" ? state.currentSessionId.trim() : "";

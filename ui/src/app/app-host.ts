@@ -236,7 +236,7 @@ function renderApprovalDocument(runtime: ApplicationRuntime) {
 }
 
 function isBrowserPanelAvailable(snapshot: ApplicationContext["gateway"]["snapshot"]): boolean {
-  if (!snapshot.connected) {
+  if (snapshot.phase !== "connected") {
     return false;
   }
   return (
@@ -341,7 +341,7 @@ class OpenClawApp extends OpenClawLightDomElement {
     if (sourceChanged || clientChanged) {
       this.syncLoginConnection(gateway);
     }
-    if (snapshot.connected) {
+    if (snapshot.phase === "connected") {
       this.loginGatePinned = false;
     }
   }
@@ -368,6 +368,7 @@ class OpenClawApp extends OpenClawLightDomElement {
       return html`<main class="app-shell app-shell--booting" aria-busy="true"></main>`;
     }
     const gatewaySnapshot = context.gateway.snapshot;
+    const gatewayConnected = gatewaySnapshot.phase === "connected";
     const gatewayUrlConfirmation = this.pendingGatewayUrl
       ? html`
           <openclaw-gateway-url-confirmation
@@ -395,7 +396,7 @@ class OpenClawApp extends OpenClawLightDomElement {
       // Embedded clients query this host immediately; keep it stable while the chunk loads.
       return html`
         <openclaw-terminal-panel
-          .client=${gatewaySnapshot.connected ? gatewaySnapshot.client : null}
+          .client=${gatewayConnected ? gatewaySnapshot.client : null}
           .available=${terminalAvailable}
           .themeMode=${resolveTerminalThemeMode()}
           fullscreen
@@ -403,7 +404,7 @@ class OpenClawApp extends OpenClawLightDomElement {
         ${!isOptionalElementDefined(TERMINAL_PANEL_ELEMENT) && terminalAvailable
           ? renderConnectingSplash(context.basePath)
           : nothing}
-        ${!terminalAvailable && (gatewaySnapshot.connected || gatewaySnapshot.lastError)
+        ${!terminalAvailable && (gatewayConnected || gatewaySnapshot.lastError)
           ? html`<div class="terminal-view-unavailable">${t("terminal.unavailable")}</div>`
           : nothing}
       `;
@@ -416,8 +417,8 @@ class OpenClawApp extends OpenClawLightDomElement {
     // the moment the attempt fails (lastError set on every close).
     const initialConnectPending =
       this.initialAuthPresent &&
-      !gatewaySnapshot.connected &&
-      !gatewaySnapshot.reconnecting &&
+      !gatewayConnected &&
+      gatewaySnapshot.phase !== "reconnecting" &&
       !this.loginGatePinned &&
       gatewaySnapshot.lastError === null &&
       gatewaySnapshot.client !== null;
@@ -429,14 +430,14 @@ class OpenClawApp extends OpenClawLightDomElement {
       `;
     }
     const showLoginGate =
-      !gatewaySnapshot.connected && (this.loginGatePinned || !gatewaySnapshot.reconnecting);
+      !gatewayConnected && (this.loginGatePinned || gatewaySnapshot.phase !== "reconnecting");
     if (showLoginGate) {
       return html`
         <openclaw-tooltip-provider>
           <openclaw-login-gate
             .props=${{
               basePath: context.basePath,
-              connected: gatewaySnapshot.connected,
+              connected: gatewayConnected,
               lastError: gatewaySnapshot.lastError,
               lastErrorCode: gatewaySnapshot.lastErrorCode,
               hasToken: Boolean(this.loginToken.trim()),
@@ -689,7 +690,7 @@ class OpenClawShell extends OpenClawLightDomElement {
       }
       const prefs = changedServerUiPrefs(previous, next);
       const snapshot = this.context?.gateway.snapshot;
-      if (prefs && snapshot?.connected && snapshot.client) {
+      if (prefs && snapshot?.phase === "connected" && snapshot.client) {
         pushServerUiPrefs(snapshot.client, prefs);
       }
     });
@@ -1306,7 +1307,7 @@ class OpenClawShell extends OpenClawLightDomElement {
     this.syncSidebarWorkboard();
     // Chunks are usually served by the gateway, so a failed idle load of the
     // outbox module recovers on reconnect, not only on a browser online event.
-    if (snapshot.connected) {
+    if (snapshot.phase === "connected") {
       void this.outboxStoreImport.load().catch(() => undefined);
     }
   }
@@ -1329,7 +1330,7 @@ class OpenClawShell extends OpenClawLightDomElement {
         this.syncSidebarWorkboard();
         return;
       }
-      runtime.sync(snapshot.client, snapshot.connected);
+      runtime.sync(snapshot.client, snapshot.phase === "connected");
       return;
     }
     if (this.sidebarWorkboardRuntimeLoad) {
@@ -1365,7 +1366,7 @@ class OpenClawShell extends OpenClawLightDomElement {
           gateway &&
           isWorkboardEnabledInConfigSnapshot(current.runtimeConfig.state.configSnapshot)
         ) {
-          loadedRuntime.sync(gateway.client, gateway.connected);
+          loadedRuntime.sync(gateway.client, gateway.phase === "connected");
         }
       })
       .catch(() => {
@@ -1393,15 +1394,12 @@ class OpenClawShell extends OpenClawLightDomElement {
   }
 
   private ensureRuntimeConfig(
-    snapshot: {
-      client: GatewayBrowserClient | null;
-      connected: boolean;
-    },
+    snapshot: ApplicationContext["gateway"]["snapshot"],
     runtimeConfig = this.context?.runtimeConfig,
   ) {
     // The sidebar hides config-gated routes (Workboard), so the snapshot must
     // load eagerly instead of waiting for a page that happens to fetch it.
-    if (!snapshot.connected || !snapshot.client || !runtimeConfig) {
+    if (snapshot.phase !== "connected" || !snapshot.client || !runtimeConfig) {
       this.runtimeConfigClient = null;
       return;
     }
@@ -1431,10 +1429,10 @@ class OpenClawShell extends OpenClawLightDomElement {
   }
 
   private ensureAgentsList(
-    snapshot: { client: GatewayBrowserClient | null; connected: boolean },
+    snapshot: ApplicationContext["gateway"]["snapshot"],
     agents = this.context?.agents,
   ) {
-    if (!snapshot.connected || !snapshot.client) {
+    if (snapshot.phase !== "connected" || !snapshot.client) {
       this.agentsListClient = null;
       return;
     }
@@ -1522,6 +1520,7 @@ class OpenClawShell extends OpenClawLightDomElement {
       return nothing;
     }
     const gatewaySnapshot = context.gateway.snapshot;
+    const gatewayConnected = gatewaySnapshot.phase === "connected";
     const outboxScopeHost = {
       settings: { gatewayUrl: context.gateway.connection.gatewayUrl },
       assistantAgentId: gatewaySnapshot.assistantAgentId,
@@ -1701,14 +1700,14 @@ class OpenClawShell extends OpenClawLightDomElement {
                   context.basePath,
                 ) ?? ""}
                 .sessionKey=${this.activeSessionKey}
-                .connected=${gatewaySnapshot.connected}
+                .connected=${gatewayConnected}
                 .offline=${gatewaySnapshot.offlineStable}
                 .outboxCountForSession=${outboxCountForSession}
                 .queuedOutboxCount=${storedOutboxes?.total ?? 0}
                 .lastError=${gatewaySnapshot.lastError}
                 .terminalAvailable=${terminalAvailable}
                 .catalogOpenTarget=${normalizeCatalogOpenTarget(uiSettings.catalogOpenTarget)}
-                .canPairDevice=${gatewaySnapshot.connected &&
+                .canPairDevice=${gatewayConnected &&
                 hasOperatorAdminAccess(gatewaySnapshot.hello?.auth ?? null)}
                 .sidebarEntries=${navigationSnapshot.sidebarEntries}
                 .workboardBoards=${this.sidebarWorkboardSnapshot.boards}
@@ -1816,12 +1815,12 @@ class OpenClawShell extends OpenClawLightDomElement {
           ></openclaw-router-outlet>
         </main>
         <openclaw-terminal-panel
-          .client=${gatewaySnapshot.connected ? gatewaySnapshot.client : null}
+          .client=${gatewayConnected ? gatewaySnapshot.client : null}
           .available=${terminalAvailable}
           .themeMode=${resolveTerminalThemeMode()}
         ></openclaw-terminal-panel>
         <openclaw-browser-panel
-          .client=${gatewaySnapshot.connected ? gatewaySnapshot.client : null}
+          .client=${gatewayConnected ? gatewaySnapshot.client : null}
           .available=${browserPanelAvailable}
           .basePath=${context.basePath}
           .authToken=${resolveControlUiAuthToken({
