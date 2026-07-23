@@ -153,7 +153,8 @@ export function readPluginSdkSurfaceBudgets(env = process.env) {
       // +2: attributed-range renderer and its options contract.
       // +1: agent-harness transcript visibility projector.
       // +1: outbound formatting capability profile.
-      4691,
+      // +1: canonical incognito session classifier for storage-safe plugin behavior.
+      4692,
       env,
     ),
     publicFunctionExports: readPluginSdkSurfaceBudgetEnv(
@@ -167,7 +168,8 @@ export function readPluginSdkSurfaceBudgets(env = process.env) {
       // +2: generic inbound-root and SCP-host schema validators.
       // +1: attributed-range renderer.
       // +1: agent-harness transcript visibility projector.
-      2840,
+      // +1: canonical incognito session classifier for storage-safe plugin behavior.
+      2841,
       env,
     ),
     publicDeprecatedExports: readPluginSdkSurfaceBudgetEnv(
