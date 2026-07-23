@@ -1,3 +1,4 @@
+import { resolveCronJobEffectiveAgentId } from "../../cron/agent-id.js";
 import type { CronJob, CronJobCreate, CronJobPatch } from "../../cron/types.js";
 import { normalizeAgentId } from "../../routing/session-key.js";
 import { parseAgentSessionKey } from "../../sessions/session-key-utils.js";
@@ -23,17 +24,6 @@ export function readCronCallerScope(
   };
 }
 
-function resolveCronJobEffectiveAgentId(
-  job: { agentId?: string },
-  defaultAgentId?: string,
-): string {
-  const agentId = job.agentId ?? defaultAgentId;
-  if (!agentId) {
-    throw new Error("Cron job has no agent id and no configured default was provided.");
-  }
-  return normalizeAgentId(agentId);
-}
-
 function parseAgentIdFromSessionRef(value: string | undefined | null): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? parseAgentSessionKey(trimmed)?.agentId : undefined;
@@ -56,7 +46,8 @@ function cronJobSessionRefsMatchCaller(job: CronJob, callerScope: CronCallerScop
 }
 
 function resolveCronJobOwnerAgentId(job: CronJob): string | undefined {
-  const ownerAgentId = job.owner?.agentId ?? parseAgentIdFromSessionRef(job.owner?.sessionKey);
+  const ownerAgentId =
+    job.owner?.agentId?.trim() || parseAgentIdFromSessionRef(job.owner?.sessionKey);
   return ownerAgentId ? normalizeAgentId(ownerAgentId) : undefined;
 }
 
@@ -108,18 +99,17 @@ export function cronJobMatchesDeclarationScope(params: {
 
   const inputOwnerSessionKey = params.input.owner?.sessionKey;
   const inputOwnerAgentId =
-    params.input.owner?.agentId ?? parseAgentIdFromSessionRef(inputOwnerSessionKey);
+    params.input.owner?.agentId?.trim() || parseAgentIdFromSessionRef(inputOwnerSessionKey);
   if (inputOwnerSessionKey && !inputOwnerAgentId) {
     return params.job.owner?.sessionKey === inputOwnerSessionKey;
   }
-  const inputAgentIdRaw = inputOwnerAgentId ?? params.input.agentId ?? params.defaultAgentId;
-  const jobAgentIdRaw =
-    resolveCronJobOwnerAgentId(params.job) ?? params.job.agentId ?? params.defaultAgentId;
-  if (!inputAgentIdRaw || !jobAgentIdRaw) {
-    throw new Error("Cron declaration has no agent id and no configured default was provided.");
-  }
-  const inputAgentId = normalizeAgentId(inputAgentIdRaw);
-  const jobAgentId = normalizeAgentId(jobAgentIdRaw);
+  const inputAgentId = inputOwnerAgentId
+    ? normalizeAgentId(inputOwnerAgentId)
+    : resolveCronJobEffectiveAgentId(params.input, params.defaultAgentId);
+  const jobOwnerAgentId = resolveCronJobOwnerAgentId(params.job);
+  const jobAgentId = jobOwnerAgentId
+    ? normalizeAgentId(jobOwnerAgentId)
+    : resolveCronJobEffectiveAgentId(params.job, params.defaultAgentId);
   return jobAgentId === inputAgentId;
 }
 
@@ -154,7 +144,7 @@ export function applyCronCreateCallerScopeDefault(
   }
   return {
     ...job,
-    agentId: job.agentId ?? callerScope.agentId,
+    agentId: job.agentId?.trim() ? job.agentId : callerScope.agentId,
     owner: {
       agentId: callerScope.agentId,
       ...(callerScope.sessionKey ? { sessionKey: callerScope.sessionKey } : {}),

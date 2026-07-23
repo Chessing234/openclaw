@@ -153,7 +153,8 @@ export function readPluginSdkSurfaceBudgets(env = process.env) {
       // +2: attributed-range renderer and its options contract.
       // +1: agent-harness transcript visibility projector.
       // +1: outbound formatting capability profile.
-      4691,
+      // +1: typed owner-required error for session store path resolution.
+      4692,
       env,
     ),
     publicFunctionExports: readPluginSdkSurfaceBudgetEnv(
