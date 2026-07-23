@@ -125,6 +125,8 @@ describe("manifest model id normalization", () => {
 
     writeNormalizerManifest({ pluginDir: pluginDirA, prefix: "bravo-local" });
     expect(normalizeDemoModel()).toBe("alpha/demo-model");
+    clearPluginMetadataLifecycleCaches();
+    expect(normalizeDemoModel()).toBe("bravo-local/demo-model");
 
     const stateDirB = makeTempDir();
     const pluginDirB = path.join(stateDirB, "extensions", "normalizer");
@@ -132,7 +134,6 @@ describe("manifest model id normalization", () => {
     writeNormalizerManifest({ pluginDir: pluginDirB, prefix: "charlie" });
 
     setTestEnvValue("OPENCLAW_STATE_DIR", stateDirB);
-    clearPluginMetadataLifecycleCaches();
     expect(normalizeDemoModel()).toBe("charlie/demo-model");
   });
 

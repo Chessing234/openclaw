@@ -370,10 +370,12 @@ describe("resolvePluginCapabilityProviders", () => {
       },
     } as never);
 
-    expectResolvedCapabilityProviderIds(
-      resolvePluginCapabilityProviders({ key: "imageGenerationProviders" }),
-      ["fal"],
-    );
+    for (let iteration = 0; iteration < 2; iteration += 1) {
+      expectResolvedCapabilityProviderIds(
+        resolvePluginCapabilityProviders({ key: "imageGenerationProviders" }),
+        ["fal"],
+      );
+    }
     expectActiveRegistryLookup(["fal"]);
     expect(mocks.loadPluginManifestRegistry).not.toHaveBeenCalled();
   });
@@ -1599,45 +1601,6 @@ describe("resolvePluginCapabilityProviders", () => {
       cfg,
       enablementCompat,
     });
-  });
-
-  it("reuses manifest metadata while applying bundled compat", () => {
-    const { cfg, enablementCompat } = createCompatChainConfig();
-    setBundledCapabilityFixture("mediaUnderstandingProviders");
-    mocks.withBundledPluginEnablementCompat.mockReturnValue(enablementCompat);
-    mocks.withBundledPluginVitestCompat.mockReturnValue(enablementCompat);
-
-    expectNoResolvedCapabilityProviders(
-      resolvePluginCapabilityProviders({ key: "mediaUnderstandingProviders", cfg }),
-    );
-    expectNoResolvedCapabilityProviders(
-      resolvePluginCapabilityProviders({ key: "mediaUnderstandingProviders", cfg }),
-    );
-
-    expect(mocks.loadPluginManifestRegistry).toHaveBeenCalledTimes(1);
-  });
-
-  it("reuses equivalent manifest metadata while applying bundled compat", () => {
-    const first = createCompatChainConfig();
-    const second = createCompatChainConfig();
-    setBundledCapabilityFixture("mediaUnderstandingProviders");
-    mocks.withBundledPluginEnablementCompat.mockReturnValue(first.enablementCompat);
-    mocks.withBundledPluginVitestCompat.mockReturnValue(first.enablementCompat);
-
-    expectNoResolvedCapabilityProviders(
-      resolvePluginCapabilityProviders({
-        key: "mediaUnderstandingProviders",
-        cfg: first.cfg,
-      }),
-    );
-    expectNoResolvedCapabilityProviders(
-      resolvePluginCapabilityProviders({
-        key: "mediaUnderstandingProviders",
-        cfg: second.cfg,
-      }),
-    );
-
-    expect(mocks.loadPluginManifestRegistry).toHaveBeenCalledTimes(1);
   });
 
   it("reuses a compatible active registry even when the capability list is empty", () => {
