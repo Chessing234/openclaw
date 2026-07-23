@@ -493,6 +493,7 @@ type SessionCompactionCheckpointPreview = Pick<
 
 export type GatewaySessionRow = {
   key: string;
+  incognito?: true;
   spawnedBy?: string;
   controlOwnerSessionKey?: string;
   /** Collector swarm group that owns this child session, when applicable. */
