@@ -18,11 +18,6 @@ import {
   resolveThreadBindingMaxAgeMsForChannel,
   resolveThreadBindingSpawnPolicy,
 } from "../channels/thread-bindings-policy.js";
-import {
-  lookupIncognitoSessionAgentId,
-  registerIncognitoSession,
-  unregisterIncognitoSession,
-} from "../config/sessions/incognito-session-registry.js";
 import { buildSessionCreationStamp } from "../config/sessions/session-entry-provenance.js";
 import type { SessionEntry } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -31,7 +26,12 @@ import { isFastTestRuntimeEnv } from "../infra/env.js";
 import { stringifyRouteThreadId } from "../plugin-sdk/channel-route.js";
 import { listRegisteredPluginAgentPromptGuidance } from "../plugins/command-registry-state.js";
 import type { SubagentLifecycleHookRunner } from "../plugins/hooks.js";
-import { isValidAgentId, normalizeAgentId, parseAgentSessionKey } from "../routing/session-key.js";
+import {
+  isIncognitoSessionKey,
+  isValidAgentId,
+  normalizeAgentId,
+  parseAgentSessionKey,
+} from "../routing/session-key.js";
 import { recordSessionCreated, recordSubagentSpawned } from "../sessions/session-state-events.js";
 import type { FastMode } from "../shared/fast-mode.js";
 import { resolveIncognitoOpenClawAgentSqlitePath } from "../state/openclaw-agent-db.js";
@@ -1268,7 +1268,11 @@ export async function spawnSubagentDirect(
       requesterGroupSpace: ctx.agentGroupSpace,
       requesterMemberRoleIds: ctx.agentMemberRoleIds,
     });
-    const childSessionKey = mintSpawnSessionKey({ targetAgentId, backend: "subagent" });
+    const incognito = isIncognitoSessionKey(requesterInternalKey);
+    const mintedChildSessionKey = mintSpawnSessionKey({ targetAgentId, backend: "subagent" });
+    const childSessionKey = incognito
+      ? mintedChildSessionKey.replace(":subagent:", ":subagent:incognito-")
+      : mintedChildSessionKey;
     const requesterRuntime = resolveSandboxRuntimeStatus({
       cfg,
       sessionKey: requesterInternalKey,
@@ -1353,10 +1357,6 @@ export async function spawnSubagentDirect(
       }
     }
     const resolvedModelMetadata = buildResolvedSubagentModelMetadata(resolvedModel);
-    const incognito = lookupIncognitoSessionAgentId(requesterInternalKey) !== undefined;
-    if (incognito) {
-      registerIncognitoSession(childSessionKey, targetAgentId);
-    }
     let childCreationEntry: SessionEntry | undefined;
     const patchChildSession = async (
       patch: Record<string, unknown>,
@@ -1417,9 +1417,6 @@ export async function spawnSubagentDirect(
       }),
     );
     if (initialPatchError) {
-      if (incognito) {
-        unregisterIncognitoSession(childSessionKey);
-      }
       return {
         status: "error",
         error: initialPatchError,
