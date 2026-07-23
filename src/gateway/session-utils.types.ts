@@ -49,6 +49,7 @@ type SessionCompactionCheckpointPreview = Pick<
 
 export type GatewaySessionRow = {
   key: string;
+  incognito?: true;
   spawnedBy?: string;
   /** Current runtime controller, falling back to the durable spawning session. */
   controlOwnerSessionKey?: string;
