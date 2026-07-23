@@ -409,7 +409,7 @@ function resolveSessionLogPath(
   sessionId?: string,
   sessionEntry?: SessionEntry,
   sessionKey?: string,
-  opts?: { storePath?: string },
+  opts?: { agentId?: string; storePath?: string },
 ): string | undefined {
   if (!sessionId) {
     return undefined;
@@ -423,7 +423,9 @@ function resolveSessionLogPath(
     if (parseSqliteSessionFileMarker(sessionFile)) {
       return sessionFile;
     }
-    const agentId = resolveAgentIdFromSessionKey(sessionKey);
+    const agentId =
+      opts?.agentId ??
+      (sessionKey?.startsWith("agent:") ? resolveAgentIdFromSessionKey(sessionKey) : undefined);
     if (!sessionFile && agentId && opts?.storePath) {
       return formatSqliteSessionFileMarker({
         agentId,
@@ -510,7 +512,7 @@ async function readSessionLogSnapshot(params: {
   sessionId?: string;
   sessionEntry?: SessionEntry;
   sessionKey?: string;
-  opts?: { storePath?: string };
+  opts?: { agentId?: string; storePath?: string };
   includeByteSize: boolean;
   includeUsage: boolean;
 }): Promise<SessionLogSnapshot> {
@@ -651,6 +653,7 @@ type TranscriptTokenEstimate = {
 };
 
 async function estimatePromptTokensFromSessionTranscript(params: {
+  agentId?: string;
   sessionId?: string;
   sessionEntry?: SessionEntry;
   sessionKey?: string;
@@ -665,7 +668,7 @@ async function estimatePromptTokensFromSessionTranscript(params: {
       sessionId,
       sessionEntry: params.sessionEntry,
       sessionKey: params.sessionKey,
-      opts: { storePath: params.storePath },
+      opts: { agentId: params.agentId, storePath: params.storePath },
       includeByteSize: true,
       includeUsage: true,
     });
@@ -839,6 +842,7 @@ export async function runPreflightCompactionIfNeeded(params: {
     typeof freshPersistedTokens === "number" && !freshNeedsOutputRead
       ? undefined
       : await estimatePromptTokensFromSessionTranscript({
+          agentId: params.followupRun.run.agentId,
           sessionId: entry.sessionId,
           sessionEntry: entry,
           sessionKey: params.sessionKey ?? params.followupRun.run.sessionKey,
@@ -850,7 +854,7 @@ export async function runPreflightCompactionIfNeeded(params: {
           sessionId: entry.sessionId,
           sessionEntry: entry,
           sessionKey: params.sessionKey ?? params.followupRun.run.sessionKey,
-          opts: { storePath: params.storePath },
+          opts: { agentId: params.followupRun.run.agentId, storePath: params.storePath },
           includeByteSize: true,
           includeUsage: false,
         })
@@ -953,7 +957,7 @@ export async function runPreflightCompactionIfNeeded(params: {
       entry.sessionId,
       entry,
       params.sessionKey ?? params.followupRun.run.sessionKey,
-      { storePath: params.storePath },
+      { agentId: params.followupRun.run.agentId, storePath: params.storePath },
     );
     if (!sessionFile) {
       await notifyTerminalCompaction("skipped");
@@ -1187,7 +1191,7 @@ export async function runMemoryFlushIfNeeded(params: {
         sessionId: params.followupRun.run.sessionId,
         sessionEntry: entry,
         sessionKey: params.sessionKey ?? params.followupRun.run.sessionKey,
-        opts: { storePath: params.storePath },
+        opts: { agentId: params.followupRun.run.agentId, storePath: params.storePath },
         includeByteSize: shouldCheckTranscriptSizeForForcedFlush,
         includeUsage: shouldReadTranscript,
       })
