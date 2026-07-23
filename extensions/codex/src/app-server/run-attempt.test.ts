@@ -394,8 +394,6 @@ async function buildCodexTurnContextForTest(
     promptText: codexTurnPromptText,
     turnScopedDeveloperInstructions: workspaceBootstrapContext.turnScopedDeveloperInstructions,
     memoryCollaborationInstructions: workspaceBootstrapContext.memoryCollaborationInstructions,
-    heartbeatCollaborationInstructions:
-      workspaceBootstrapContext.heartbeatCollaborationInstructions,
   });
   const collaborationInstructions =
     turnStartParams.collaborationMode?.settings?.developer_instructions ?? "";

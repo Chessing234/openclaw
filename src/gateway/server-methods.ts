@@ -457,6 +457,8 @@ export const coreGatewayHandlers: GatewayRequestHandlers = {
       "cron.list",
       "cron.status",
       "cron.get",
+      "cron.scratch.get",
+      "cron.scratch.set",
       "cron.add",
       "cron.update",
       "cron.remove",
