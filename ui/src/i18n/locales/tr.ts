@@ -675,6 +675,8 @@ export const tr: TranslationMap = {
     openWorkboardCard: "Workboard kartını aç",
     dashboardAvailable: "Pano kullanılabilir",
     approvalNeeded: "Onay gerekli",
+    queuedMessage: "Gönderilmek üzere {count} mesaj sıraya alındı",
+    queuedMessages: "Gönderilmek üzere {count} mesaj sıraya alındı",
     noSessions: "Oturum bulunamadı.",
     noActiveSessions: "Etkin konu yok.",
     noArchivedSessions: "Arşivlenmiş oturum yok.",
@@ -3045,6 +3047,7 @@ export const tr: TranslationMap = {
     eventStale: "Eski oturum",
   },
   connection: {
+    queuedCount: "{count} sırada",
     reconnecting: "Yeniden bağlanıyor…",
     retryNow: "Şimdi yeniden dene",
     access: {
@@ -3716,6 +3719,16 @@ export const tr: TranslationMap = {
   },
   login: {
     subtitle: "Gateway Kontrol Paneli",
+    deviceAuthMigration: {
+      banner: "Bu tarayıcının güncellemeden sonra tek seferlik cihaz onayına hâlâ ihtiyacı var.",
+      action: "Bu tarayıcıyı güvene al",
+      secureContextRequired:
+        "Bu eski tarayıcı geçici olarak kullanılabilir durumda. Cihaz kimliğiyle güvene almak için HTTPS veya localhost üzerinden yeniden açın.",
+      pendingUnavailable:
+        "Tarayıcı eşleştirme isteği henüz kullanılabilir değil. Birazdan yeniden deneyin.",
+      loadFailed: "Bu tarayıcının eşleştirme isteği yüklenemedi: {error}",
+      approvalFailed: "Bu tarayıcı güvene alınamadı: {error}",
+    },
     passwordPlaceholder: "isteğe bağlı",
     showToken: "Tokenı göster",
     hideToken: "Token'ı gizle",
@@ -4227,6 +4240,8 @@ export const tr: TranslationMap = {
       placeholderDisconnected: "Connect to the gateway to start chatting...",
       offlineHint:
         "Çevrimdışı — mesajlar sıraya alınacak ve bağlantı geri geldiğinde gönderilecek.",
+      offlineQueuedHint:
+        "Çevrimdışı — {count} sırada; bağlantı geri geldiğinde mesajlar gönderilir.",
       preparingModel: "Model hazırlanıyor...",
       responding: "{name} yanıtlıyor...",
       sendingMessage: "Mesaj gönderiliyor...",

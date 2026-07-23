@@ -672,6 +672,8 @@ export const fa: TranslationMap = {
     openWorkboardCard: "باز کردن کارت Workboard",
     dashboardAvailable: "داشبورد در دسترس است",
     approvalNeeded: "نیازمند تأیید",
+    queuedMessage: "{count} پیام برای ارسال در صف قرار گرفت",
+    queuedMessages: "{count} پیام برای ارسال در صف قرار گرفت",
     noSessions: "هیچ نشستی پیدا نشد.",
     noActiveSessions: "هیچ رشته فعالی نیست.",
     noArchivedSessions: "هیچ نشست بایگانی‌شده‌ای نیست.",
@@ -3023,6 +3025,7 @@ export const fa: TranslationMap = {
     eventStale: "نشست منقضی‌شده",
   },
   connection: {
+    queuedCount: "{count} در صف",
     reconnecting: "در حال اتصال مجدد…",
     retryNow: "اکنون دوباره تلاش کنید",
     access: {
@@ -3691,6 +3694,15 @@ export const fa: TranslationMap = {
   },
   login: {
     subtitle: "داشبورد Gateway",
+    deviceAuthMigration: {
+      banner: "این مرورگر پس از به‌روزرسانی همچنان به تأیید یک‌باره دستگاه نیاز دارد.",
+      action: "امن‌سازی این مرورگر",
+      secureContextRequired:
+        "این مرورگر قدیمی به‌طور موقت در دسترس باقی می‌ماند. برای امن‌سازی آن با هویت دستگاه، آن را از طریق HTTPS یا localhost دوباره باز کنید.",
+      pendingUnavailable: "درخواست جفت‌سازی مرورگر هنوز در دسترس نیست. لحظه‌ای بعد دوباره تلاش کنید.",
+      loadFailed: "بارگذاری درخواست جفت‌سازی این مرورگر ممکن نشد: {error}",
+      approvalFailed: "امن‌سازی این مرورگر ممکن نشد: {error}",
+    },
     passwordPlaceholder: "اختیاری",
     showToken: "نمایش توکن",
     hideToken: "پنهان کردن توکن",
@@ -4200,6 +4212,7 @@ export const fa: TranslationMap = {
       placeholderWithAttachments: "Add a message or paste more images...",
       placeholderDisconnected: "Connect to the gateway to start chatting...",
       offlineHint: "آفلاین — پیام‌ها در صف قرار می‌گیرند و هنگام بازگشت اتصال ارسال می‌شوند.",
+      offlineQueuedHint: "آفلاین — {count} در صف؛ پیام‌ها هنگام بازگشت اتصال ارسال می‌شوند.",
       preparingModel: "در حال آماده‌سازی مدل...",
       responding: "{name} در حال پاسخ‌دهی است...",
       sendingMessage: "در حال ارسال پیام...",

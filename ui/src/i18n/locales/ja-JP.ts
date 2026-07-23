@@ -683,6 +683,8 @@ export const ja_JP: TranslationMap = {
     openWorkboardCard: "Workboardカードを開く",
     dashboardAvailable: "ダッシュボードが利用可能",
     approvalNeeded: "承認が必要",
+    queuedMessage: "{count} 件のメッセージが送信待ちです",
+    queuedMessages: "{count} 件のメッセージが送信待ちです",
     noSessions: "セッションが見つかりません。",
     noActiveSessions: "アクティブなスレッドはありません。",
     noArchivedSessions: "アーカイブされたセッションはありません。",
@@ -3046,6 +3048,7 @@ export const ja_JP: TranslationMap = {
     eventStale: "古いセッション",
   },
   connection: {
+    queuedCount: "{count} 件待機中",
     reconnecting: "再接続中…",
     retryNow: "今すぐ再試行",
     access: {
@@ -3716,6 +3719,16 @@ export const ja_JP: TranslationMap = {
   },
   login: {
     subtitle: "Gateway ダッシュボード",
+    deviceAuthMigration: {
+      banner: "このブラウザーは、更新後に一度だけデバイスの承認が必要です。",
+      action: "このブラウザーを保護する",
+      secureContextRequired:
+        "このレガシーブラウザーは一時的に利用可能です。HTTPS または localhost 経由で開き直して、デバイスIDで保護してください。",
+      pendingUnavailable:
+        "ブラウザーのペアリングリクエストはまだ利用できません。しばらくしてから再試行してください。",
+      loadFailed: "このブラウザーのペアリングリクエストを読み込めませんでした: {error}",
+      approvalFailed: "このブラウザーを保護できませんでした: {error}",
+    },
     passwordPlaceholder: "任意",
     showToken: "トークンを表示",
     hideToken: "トークンを非表示",
@@ -4226,6 +4239,8 @@ export const ja_JP: TranslationMap = {
       placeholderWithAttachments: "Add a message or paste more images...",
       placeholderDisconnected: "Connect to the gateway to start chatting...",
       offlineHint: "オフライン — メッセージはキューに入り、接続が回復したときに送信されます。",
+      offlineQueuedHint:
+        "オフライン — {count} 件待機中。接続が復旧するとメッセージが送信されます。",
       preparingModel: "モデルを準備中...",
       responding: "{name}が応答中...",
       sendingMessage: "メッセージを送信中...",

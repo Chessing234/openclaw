@@ -649,6 +649,8 @@ export const zh_TW: TranslationMap = {
     openWorkboardCard: "開啟 Workboard 卡片",
     dashboardAvailable: "儀表板可用",
     approvalNeeded: "需要核准",
+    queuedMessage: "{count} 則訊息已排入傳送佇列",
+    queuedMessages: "{count} 則訊息已排入傳送佇列",
     noSessions: "找不到工作階段。",
     noActiveSessions: "沒有作用中的討論串。",
     noArchivedSessions: "沒有已封存的工作階段。",
@@ -2959,6 +2961,7 @@ export const zh_TW: TranslationMap = {
     eventStale: "過期工作階段",
   },
   connection: {
+    queuedCount: "已排入 {count} 則",
     reconnecting: "正在重新連線…",
     retryNow: "立即重試",
     access: {
@@ -3618,6 +3621,15 @@ export const zh_TW: TranslationMap = {
   },
   login: {
     subtitle: "閘道儀表板",
+    deviceAuthMigration: {
+      banner: "更新後，此瀏覽器仍需進行一次性裝置核准。",
+      action: "保護此瀏覽器",
+      secureContextRequired:
+        "此舊版瀏覽器暫時仍可使用。請透過 HTTPS 或 localhost 重新開啟，以裝置識別加以保護。",
+      pendingUnavailable: "瀏覽器配對請求尚未就緒。請稍後再試。",
+      loadFailed: "無法載入此瀏覽器的配對請求：{error}",
+      approvalFailed: "無法保護此瀏覽器：{error}",
+    },
     passwordPlaceholder: "可選",
     showToken: "顯示權杖",
     hideToken: "隱藏權杖",
@@ -4106,6 +4118,7 @@ export const zh_TW: TranslationMap = {
       placeholderWithAttachments: "Add a message or paste more images...",
       placeholderDisconnected: "Connect to the gateway to start chatting...",
       offlineHint: "離線——訊息將被排入佇列，並在連線恢復時傳送。",
+      offlineQueuedHint: "離線中 — 已排入 {count} 則；連線恢復後將傳送訊息。",
       preparingModel: "正在準備模型...",
       responding: "{name} 正在回覆...",
       sendingMessage: "正在傳送訊息...",
