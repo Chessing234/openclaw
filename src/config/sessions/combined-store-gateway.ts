@@ -88,8 +88,8 @@ export function loadCombinedSessionStoreForGateway(
   const storeConfig = cfg.session?.store;
   if (storeConfig && !isStorePathTemplate(storeConfig)) {
     // A single shared store still needs keys canonicalized as if owned by the default agent.
-    const storePath = resolveStorePath(storeConfig);
     const defaultAgentId = normalizeAgentId(resolveDefaultAgentId(cfg));
+    const storePath = resolveStorePath(storeConfig, { agentId: defaultAgentId });
     const store = loadGatewayStoreEntries({ agentId: defaultAgentId, storePath });
     const combined: Record<string, SessionEntry> = {};
     for (const [key, entry] of Object.entries(store)) {

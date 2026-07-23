@@ -24,7 +24,7 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { resolveStoredSessionOwnerAgentId } from "../gateway/session-store-key.js";
 import { readFileDescriptorBoundedSync } from "../infra/boundary-file-read.js";
 import { resolveSqliteDatabaseFilePaths } from "../infra/sqlite-files.js";
-import { normalizeAgentId } from "../routing/session-key.js";
+import { LEGACY_IMPLICIT_AGENT_ID, normalizeAgentId } from "../routing/session-key.js";
 import { closeOpenClawAgentDatabaseByPath } from "../state/openclaw-agent-db.js";
 import { compactDoctorSessionSqliteTarget } from "./doctor-session-sqlite-compact.js";
 import {
@@ -177,7 +177,9 @@ function resolveDoctorSessionSqliteConfig(options: DoctorSessionSqliteOptions): 
   if (options.cfg) {
     return options.cfg;
   }
-  return options.store ? {} : getRuntimeConfig();
+  return options.store
+    ? { agents: { entries: { [LEGACY_IMPLICIT_AGENT_ID]: { default: true } } } }
+    : getRuntimeConfig();
 }
 
 function resolveDoctorSessionSqliteTargets(params: {

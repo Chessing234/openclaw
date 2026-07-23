@@ -424,7 +424,7 @@ export async function listManualSetupInferenceOptions(
   if (snapshot.exists && !snapshot.valid) {
     throw new Error(invalidSetupConfigError(snapshot));
   }
-  const cfg = snapshot.exists && snapshot.valid ? (snapshot.runtimeConfig ?? snapshot.config) : {};
+  const cfg = snapshot.runtimeConfig ?? snapshot.config;
   const { workspace } = await resolveSetupInferenceWorkspace({
     configExists: snapshot.exists,
     configValid: snapshot.valid,
@@ -457,7 +457,7 @@ export async function detectSetupInference(
   if (snapshot.exists && !snapshot.valid) {
     throw new Error(invalidSetupConfigError(snapshot));
   }
-  const cfg = snapshot.exists && snapshot.valid ? (snapshot.runtimeConfig ?? snapshot.config) : {};
+  const cfg = snapshot.runtimeConfig ?? snapshot.config;
   const detected = await (deps.detectInferenceBackends ?? detectInferenceBackends)({ config: cfg });
   // Gemini CLI has no hard tool-off mode: wildcard exclusions can be
   // overridden by admin policy and do not stop discovery or MCP startup.
@@ -1704,10 +1704,12 @@ async function activateSetupInferenceUnredacted(
   if (snapshot.exists && !snapshot.valid) {
     throw new Error(invalidSetupConfigError(snapshot));
   }
-  const cfg: OpenClawConfig = snapshot.exists ? (snapshot.runtimeConfig ?? snapshot.config) : {};
-  const sourceCfg: OpenClawConfig = snapshot.exists
-    ? (snapshot.sourceConfig ?? snapshot.config)
-    : {};
+  // Missing-file snapshots still carry the load-time implicit-main roster.
+  // Setup must probe against that runtime view without treating it as authored config.
+  const cfg: OpenClawConfig = snapshot.runtimeConfig ?? snapshot.config;
+  // The source snapshot includes raw compatibility migrations for comparison,
+  // while the writer still projects changes back onto the untouched authored bytes.
+  const sourceCfg: OpenClawConfig = snapshot.sourceConfig ?? snapshot.config;
   const workspace = params.workspace?.trim()
     ? resolveUserPath(params.workspace)
     : (

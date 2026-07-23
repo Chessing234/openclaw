@@ -635,6 +635,7 @@ function buildMockOpenAiConfig(mockPort: number): Record<string, unknown> {
           },
         },
       },
+      entries: { main: { default: true } },
     },
     models: {
       mode: "merge",
