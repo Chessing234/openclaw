@@ -1864,7 +1864,9 @@ async function onAdmittedTimer(state: CronServiceState) {
       if (state.store?.jobs?.length) {
         for (const job of state.store.jobs) {
           const agentId =
-            typeof job.agentId === "string" && job.agentId.trim() ? job.agentId : defaultAgentId;
+            typeof job.agentId === "string" && job.agentId.trim()
+              ? normalizeAgentId(job.agentId)
+              : resolveAgentIdFromSessionKey(job.sessionKey, defaultAgentId);
           addStoreTarget(agentId, state.deps.resolveSessionStorePath(agentId));
         }
       } else {
