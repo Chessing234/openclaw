@@ -129,12 +129,15 @@ function mergeOpenIncognitoStores(params: {
 /** Loads and canonicalizes session entries for gateway views across one or more agent stores. */
 export function loadCombinedSessionStoreForGateway(
   cfg: OpenClawConfig,
-  opts: { agentId?: string; configuredAgentsOnly?: boolean } = {},
+  opts: { agentId?: string; configuredAgentsOnly?: boolean; includeIncognito?: boolean } = {},
 ): {
   storePath: string;
   store: Record<string, SessionEntry>;
 } {
   const storeConfig = cfg.session?.store;
+  // Exclusion happens before path aggregation; filtering rows afterward would
+  // still leak a live incognito handle by changing the projected store path.
+  const includeIncognito = opts.includeIncognito !== false;
   if (storeConfig && !isStorePathTemplate(storeConfig)) {
     // A single shared store still needs keys canonicalized as if owned by the default agent.
     const storePath = resolveStorePath(storeConfig);
@@ -155,11 +158,13 @@ export function loadCombinedSessionStoreForGateway(
         canonicalKey,
       });
     }
-    const incognitoStorePaths = mergeOpenIncognitoStores({
-      cfg,
-      combined,
-      ...(opts.agentId ? { agentId: normalizeAgentId(opts.agentId) } : {}),
-    });
+    const incognitoStorePaths = includeIncognito
+      ? mergeOpenIncognitoStores({
+          cfg,
+          combined,
+          ...(opts.agentId ? { agentId: normalizeAgentId(opts.agentId) } : {}),
+        })
+      : [];
     return {
       storePath: incognitoStorePaths.length > 0 ? "(multiple)" : storePath,
       store: combined,
@@ -196,11 +201,13 @@ export function loadCombinedSessionStoreForGateway(
     }
   }
 
-  const incognitoStorePaths = mergeOpenIncognitoStores({
-    cfg,
-    combined,
-    ...(requestedAgentId ? { agentId: requestedAgentId } : {}),
-  });
+  const incognitoStorePaths = includeIncognito
+    ? mergeOpenIncognitoStores({
+        cfg,
+        combined,
+        ...(requestedAgentId ? { agentId: requestedAgentId } : {}),
+      })
+    : [];
 
   const allStorePaths = [...targets.map((target) => target.storePath), ...incognitoStorePaths];
   const storePath =

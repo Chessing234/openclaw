@@ -408,6 +408,15 @@ test("incognito operator RPCs are visible only to admin-scope connections", asyn
     deviceIdentityPath: path.join(dir, "writer-device.json"),
   });
   try {
+    const readerListBefore = await rpcReq<{
+      path?: string;
+      sessions?: Array<{ key?: string }>;
+    }>(reader.ws, "sessions.list", {});
+    expect(readerListBefore.ok).toBe(true);
+    const durableOnlyPath = readerListBefore.payload?.path;
+    expect(durableOnlyPath).toBeTruthy();
+    expect(durableOnlyPath).not.toBe("(multiple)");
+
     const created = await rpcReq<{ key?: string; sessionId?: string }>(
       admin.ws,
       "sessions.create",
@@ -427,9 +436,14 @@ test("incognito operator RPCs are visible only to admin-scope connections", asyn
       await expect(rpcReq(ws, "sessions.subscribe", {})).resolves.toMatchObject({ ok: true });
     }
     for (const ws of [reader.ws, writer.ws]) {
-      const listed = await rpcReq<{ sessions?: Array<{ key?: string }> }>(ws, "sessions.list", {});
+      const listed = await rpcReq<{ path?: string; sessions?: Array<{ key?: string }> }>(
+        ws,
+        "sessions.list",
+        {},
+      );
       expect(listed.ok).toBe(true);
       expect(listed.payload?.sessions?.some((session) => session.key === sessionKey)).toBe(false);
+      expect(listed.payload?.path).toBe(durableOnlyPath);
     }
 
     const deniedCreate = await rpcReq(writer.ws, "sessions.create", {

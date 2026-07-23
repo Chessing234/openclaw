@@ -15,6 +15,7 @@ import {
   isConfiguredSessionStoreAgentId,
   isPerAgentSessionStoreConfig,
   resolveExistingAgentSessionStoreTargetsSync,
+  resolveStorePath,
   runSessionsCleanup,
   serializeSessionCleanupResult,
   type SessionEntry,
@@ -76,6 +77,8 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
       return;
     }
     const cfg = context.getRuntimeConfig();
+    const includeIncognito =
+      !client?.connect || client.connect.scopes?.includes(ADMIN_SCOPE) === true;
     const requestedAgentId = params.agentId ? normalizeAgentId(params.agentId) : undefined;
     const sessionKeys = params.sessionKeys?.map((sessionKey) =>
       requestedAgentId
@@ -111,7 +114,7 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
       );
       return;
     }
-    const scopedSessionKeys = configured
+    const scopedSessionKeysRaw = configured
       ? sessionKeys
       : sessionKeys?.filter((sessionKey) => {
           const sessionAgentId =
@@ -120,6 +123,9 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
               : resolveSessionStoreAgentId(cfg, sessionKey);
           return sessionAgentId === agentId;
         });
+    const scopedSessionKeys = includeIncognito
+      ? scopedSessionKeysRaw
+      : scopedSessionKeysRaw?.filter((sessionKey) => !isIncognitoSessionKey(sessionKey));
     if (!configured && scopedSessionKeys?.length === 0) {
       respond(true, { results: [] }, undefined);
       return;
@@ -132,14 +138,27 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
       return;
     }
     try {
+      const configuredVisibleSessionKeys =
+        !includeIncognito && configured && scopedSessionKeys === undefined
+          ? listSessionEntriesReadOnly({
+              agentId,
+              storePath: resolveStorePath(cfg.session?.store, { agentId }),
+            })
+              .map((entry) => entry.sessionKey)
+              .filter((sessionKey) => !isIncognitoSessionKey(sessionKey))
+          : undefined;
       const searchTargets = configured ? [undefined] : existingTargets;
       const targetResults = searchTargets.flatMap((target) => {
         const targetSessionKeys =
           scopedSessionKeys ??
-          (target && !isPerAgentSessionStoreConfig(cfg.session?.store)
+          configuredVisibleSessionKeys ??
+          (target && (!includeIncognito || !isPerAgentSessionStoreConfig(cfg.session?.store))
             ? listSessionEntriesReadOnly({ agentId: target.agentId, storePath: target.storePath })
                 .map((entry) => entry.sessionKey)
                 .filter((sessionKey) => {
+                  if (!includeIncognito && isIncognitoSessionKey(sessionKey)) {
+                    return false;
+                  }
                   const parsed = parseAgentSessionKey(sessionKey);
                   return !parsed || normalizeAgentId(parsed.agentId) === agentId;
                 })
@@ -160,11 +179,8 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
         ];
       });
       const limit = params.limit ?? 10;
-      const includeIncognito =
-        !client?.connect || client.connect.scopes?.includes(ADMIN_SCOPE) === true;
       const sortedHits = targetResults
         .flatMap((result) => result.hits)
-        .filter((hit) => includeIncognito || !isIncognitoSessionKey(hit.sessionKey))
         .toSorted(
           (left, right) =>
             right.score - left.score ||
@@ -197,6 +213,8 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
     }
     const p = params;
     const cfg = context.getRuntimeConfig();
+    const includeIncognito =
+      !client?.connect || client.connect.scopes?.includes(ADMIN_SCOPE) === true;
     const configuredAgentsOnly = p.configuredAgentsOnly === true;
     const payload = await measureDiagnosticsTimelineSpan(
       "gateway.sessions.list",
@@ -206,6 +224,7 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
           () =>
             loadCombinedSessionStoreForGateway(cfg, {
               agentId: p.agentId,
+              includeIncognito,
             }),
           {
             config: cfg,
@@ -216,18 +235,9 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
             },
           },
         );
-        const includeIncognito =
-          !client?.connect || client.connect.scopes?.includes(ADMIN_SCOPE) === true;
-        // Operator list rows can reveal transcript-derived metadata; process-only
-        // sessions are projected only to connections holding operator.admin.
-        const scopeFilteredStore = includeIncognito
-          ? store
-          : Object.fromEntries(
-              Object.entries(store).filter(([sessionKey]) => !isIncognitoSessionKey(sessionKey)),
-            );
         const listStore = configuredAgentsOnly
-          ? filterSessionStoreToConfiguredAgents(cfg, scopeFilteredStore)
-          : scopeFilteredStore;
+          ? filterSessionStoreToConfiguredAgents(cfg, store)
+          : store;
         const modelCatalog = await measureDiagnosticsTimelineSpan(
           "gateway.sessions.list.model_catalog",
           () => loadOptionalServerMethodModelCatalog(context, "sessions.list"),

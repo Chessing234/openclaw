@@ -28,7 +28,10 @@ let cfg: Record<string, unknown> = {
   agents: { list: [{ id: "main", default: true }, { id: "work" }] },
 };
 
-async function callSearch(params: Record<string, unknown>): Promise<ReturnType<typeof vi.fn>> {
+async function callSearch(
+  params: Record<string, unknown>,
+  scopes?: string[],
+): Promise<ReturnType<typeof vi.fn>> {
   const respond = vi.fn();
   await expectDefined(
     sessionsHandlers["sessions.search"],
@@ -38,7 +41,7 @@ async function callSearch(params: Record<string, unknown>): Promise<ReturnType<t
     params,
     respond: respond as unknown as RespondFn,
     context: { getRuntimeConfig: () => cfg } as unknown as GatewayRequestContext,
-    client: null,
+    client: scopes ? ({ connect: { scopes } } as never) : null,
     isWebchatConnect: () => false,
   });
   return respond;
@@ -107,6 +110,60 @@ describe("sessions.search gateway method", () => {
         indexing: true,
         truncated: true,
         results: [expect.objectContaining({ score: 1 })],
+      }),
+    );
+  });
+
+  it("filters incognito candidates before applying a non-admin result limit", async () => {
+    const incognitoKey = "agent:main:dashboard:incognito-newer";
+    const durableKey = "agent:main:dashboard:durable";
+    const incognitoHit = {
+      sessionKey: incognitoKey,
+      sessionId: "session-incognito",
+      messageId: "message-incognito",
+      role: "user",
+      timestamp: 200,
+      snippet: "needle private",
+      score: 10,
+    };
+    const durableHit = {
+      sessionKey: durableKey,
+      sessionId: "session-durable",
+      messageId: "message-durable",
+      role: "user",
+      timestamp: 100,
+      snippet: "needle durable",
+      score: 1,
+    };
+    searchSessionTranscriptsMock.mockImplementation(
+      (params: { limit?: number; sessionKeys?: string[] }) => {
+        const candidates = [incognitoHit, durableHit].filter((hit) =>
+          params.sessionKeys?.includes(hit.sessionKey),
+        );
+        return {
+          hits: candidates.slice(0, params.limit),
+          indexing: false,
+          truncated: candidates.length > (params.limit ?? candidates.length),
+        };
+      },
+    );
+    listSessionEntriesMock.mockReturnValue([
+      { sessionKey: incognitoKey, entry: { incognito: true } },
+      { sessionKey: durableKey, entry: {} },
+    ]);
+
+    const respond = await callSearch({ query: "needle", limit: 1 }, ["operator.read"]);
+
+    expect(searchSessionTranscriptsMock).toHaveBeenCalledWith({
+      agentId: "main",
+      query: "needle",
+      limit: 1,
+      sessionKeys: [durableKey],
+    });
+    expect(respond).toHaveBeenCalledWith(
+      true,
+      expect.objectContaining({
+        results: [expect.objectContaining({ sessionKey: durableKey })],
       }),
     );
   });
