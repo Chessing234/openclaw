@@ -416,7 +416,7 @@ describe("config schema regressions", () => {
     expect(res.ok).toBe(false);
   });
 
-  it("skips binding agentId check when agents.entries is absent", () => {
+  it("rejects non-default bindings when the implicit-main roster is materialized", () => {
     const res = validateConfigObject({
       bindings: [
         {
@@ -427,7 +427,7 @@ describe("config schema regressions", () => {
       ],
     });
 
-    expect(res.ok).toBe(true);
+    expect(res.ok).toBe(false);
   });
 
   it("accepts a microsoft-foundry model entry carrying thinkingLevelMap (openclaw#91011)", () => {

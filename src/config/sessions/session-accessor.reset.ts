@@ -64,14 +64,14 @@ export async function persistSessionResetLifecycle(params: {
 
 /** Loads the reply-session initialization rows without exposing a mutable store. */
 export function loadReplySessionInitializationSnapshot(params: {
+  agentId: string;
   storePath: string;
   sessionKey: string;
 }): ReplySessionInitializationSnapshot {
   const store = Object.fromEntries(
-    listSessionEntriesReadOnly({ storePath: params.storePath }).map(({ sessionKey, entry }) => [
-      sessionKey,
-      entry,
-    ]),
+    listSessionEntriesReadOnly({ agentId: params.agentId, storePath: params.storePath }).map(
+      ({ sessionKey, entry }) => [sessionKey, entry],
+    ),
   );
   const resolved = resolveSessionEntryFromStore({ store, sessionKey: params.sessionKey });
   const currentEntry = resolved.existing ? { ...resolved.existing } : undefined;
@@ -118,10 +118,9 @@ export async function commitReplySessionInitialization(params: {
   storePath: string;
 }): Promise<ReplySessionInitializationCommitResult> {
   const store = Object.fromEntries(
-    listSessionEntries({ storePath: params.storePath }).map(({ sessionKey, entry }) => [
-      sessionKey,
-      entry,
-    ]),
+    listSessionEntries({ agentId: params.agentId, storePath: params.storePath }).map(
+      ({ sessionKey, entry }) => [sessionKey, entry],
+    ),
   );
   const resolved = resolveSessionEntryFromStore({ store, sessionKey: params.sessionKey });
   const currentEntry = resolved.existing ? { ...resolved.existing } : undefined;
@@ -215,6 +214,7 @@ export async function commitReplySessionInitialization(params: {
   }
   await applySessionEntryLifecycleMutation({
     activeSessionKey: params.activeSessionKey,
+    agentId: params.agentId,
     maintenanceOverride: params.maintenanceConfig,
     storePath: params.storePath,
     upserts,
