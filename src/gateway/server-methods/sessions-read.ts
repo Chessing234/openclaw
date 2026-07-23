@@ -26,7 +26,12 @@ import {
   measureDiagnosticsTimelineSpanSync,
 } from "../../infra/diagnostics-timeline.js";
 import { formatErrorMessage } from "../../infra/errors.js";
-import { normalizeAgentId, parseAgentSessionKey } from "../../routing/session-key.js";
+import {
+  isIncognitoSessionKey,
+  normalizeAgentId,
+  parseAgentSessionKey,
+} from "../../routing/session-key.js";
+import { ADMIN_SCOPE } from "../operator-scopes.js";
 import { resolveRequestedSessionAgentId as resolveRequestedGlobalAgentId } from "../session-create-service.js";
 import {
   resolveSessionStoreAgentId,
@@ -61,7 +66,7 @@ import type { GatewayRequestHandlers } from "./types.js";
 import { assertValidParams } from "./validation.js";
 
 export const sessionReadHandlers: GatewayRequestHandlers = {
-  "sessions.search": async ({ params, respond, context }) => {
+  "sessions.search": async ({ params, respond, context, client }) => {
     if (!assertValidParams(params, validateSessionsSearchParams, "sessions.search", respond)) {
       return;
     }
@@ -155,8 +160,11 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
         ];
       });
       const limit = params.limit ?? 10;
+      const includeIncognito =
+        !client?.connect || client.connect.scopes?.includes(ADMIN_SCOPE) === true;
       const sortedHits = targetResults
         .flatMap((result) => result.hits)
+        .filter((hit) => includeIncognito || !isIncognitoSessionKey(hit.sessionKey))
         .toSorted(
           (left, right) =>
             right.score - left.score ||
@@ -183,7 +191,7 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
       respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, formatErrorMessage(error)));
     }
   },
-  "sessions.list": async ({ params, respond, context }) => {
+  "sessions.list": async ({ params, respond, context, client }) => {
     if (!assertValidParams(params, validateSessionsListParams, "sessions.list", respond)) {
       return;
     }
@@ -208,9 +216,18 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
             },
           },
         );
+        const includeIncognito =
+          !client?.connect || client.connect.scopes?.includes(ADMIN_SCOPE) === true;
+        // Operator list rows can reveal transcript-derived metadata; process-only
+        // sessions are projected only to connections holding operator.admin.
+        const scopeFilteredStore = includeIncognito
+          ? store
+          : Object.fromEntries(
+              Object.entries(store).filter(([sessionKey]) => !isIncognitoSessionKey(sessionKey)),
+            );
         const listStore = configuredAgentsOnly
-          ? filterSessionStoreToConfiguredAgents(cfg, store)
-          : store;
+          ? filterSessionStoreToConfiguredAgents(cfg, scopeFilteredStore)
+          : scopeFilteredStore;
         const modelCatalog = await measureDiagnosticsTimelineSpan(
           "gateway.sessions.list.model_catalog",
           () => loadOptionalServerMethodModelCatalog(context, "sessions.list"),
@@ -434,7 +451,7 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
       undefined,
     );
   },
-  "sessions.resolve": async ({ params, respond, context }) => {
+  "sessions.resolve": async ({ params, respond, context, client }) => {
     if (!assertValidParams(params, validateSessionsResolveParams, "sessions.resolve", respond)) {
       return;
     }
@@ -447,6 +464,12 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
       return;
     }
     if ("missing" in resolved) {
+      respond(true, { ok: false }, undefined);
+      return;
+    }
+    const includeIncognito =
+      !client?.connect || client.connect.scopes?.includes(ADMIN_SCOPE) === true;
+    if (!includeIncognito && isIncognitoSessionKey(resolved.key)) {
       respond(true, { ok: false }, undefined);
       return;
     }

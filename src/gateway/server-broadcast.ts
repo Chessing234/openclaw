@@ -5,6 +5,7 @@ import {
 // Gateway WebSocket broadcaster.
 // Applies event scope guards and slow-consumer handling before sending frames.
 import { logRejectedLargePayload } from "../logging/diagnostic-payload.js";
+import { isIncognitoSessionKey } from "../routing/session-key.js";
 import { isBrowserCopilotClient } from "../utils/message-channel.js";
 import {
   ADMIN_SCOPE,
@@ -102,15 +103,20 @@ function hasEventScope(
   client: GatewayWsClient,
   event: string,
   explicitPluginScope?: GatewayPluginEventScope,
+  adminOnly = false,
 ): boolean {
   if (client.connectionKind === "worker") {
     return false;
   }
+  const role = client.connect.role ?? "operator";
+  const scopes = Array.isArray(client.connect.scopes) ? client.connect.scopes : [];
+  if (adminOnly && (role !== "operator" || !scopes.includes(ADMIN_SCOPE))) {
+    return false;
+  }
   if (explicitPluginScope) {
-    if ((client.connect.role ?? "operator") !== "operator") {
+    if (role !== "operator") {
       return false;
     }
-    const scopes = Array.isArray(client.connect.scopes) ? client.connect.scopes : [];
     if (scopes.includes(ADMIN_SCOPE)) {
       return true;
     }
@@ -123,11 +129,9 @@ function hasEventScope(
   // for operator.write and operator.admin scopes. Explicit plugin.* entries
   // in EVENT_SCOPE_GUARDS take precedence (e.g., plugin.approval.*).
   if (!required && event.startsWith("plugin.")) {
-    const role = client.connect.role ?? "operator";
     if (role !== "operator") {
       return false;
     }
-    const scopes = Array.isArray(client.connect.scopes) ? client.connect.scopes : [];
     return scopes.includes(WRITE_SCOPE) || scopes.includes(ADMIN_SCOPE);
   }
   if (!required) {
@@ -136,11 +140,9 @@ function hasEventScope(
   if (required.length === 0) {
     return true;
   }
-  const role = client.connect.role ?? "operator";
   if (role !== "operator") {
     return false;
   }
-  const scopes = Array.isArray(client.connect.scopes) ? client.connect.scopes : [];
   if (scopes.includes(ADMIN_SCOPE)) {
     return true;
   }
@@ -148,6 +150,20 @@ function hasEventScope(
     return scopes.includes(READ_SCOPE) || scopes.includes(WRITE_SCOPE);
   }
   return required.some((scope) => scopes.includes(scope));
+}
+
+function isIncognitoSessionEvent(payload: unknown): boolean {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return false;
+  }
+  const record = payload as { key?: unknown; session?: unknown; sessionKey?: unknown };
+  const nestedSession =
+    record.session && typeof record.session === "object" && !Array.isArray(record.session)
+      ? (record.session as { key?: unknown; sessionKey?: unknown })
+      : undefined;
+  return [record.sessionKey, record.key, nestedSession?.sessionKey, nestedSession?.key].some(
+    (value) => typeof value === "string" && isIncognitoSessionKey(value),
+  );
 }
 
 export function createGatewayBroadcaster(params: {
@@ -167,6 +183,9 @@ export function createGatewayBroadcaster(params: {
     if (params.clients.size === 0) {
       return;
     }
+    // Session events can carry transcript-derived content into another client's
+    // durable view, so every incognito event is admin-only at the fanout owner.
+    const adminOnly = isIncognitoSessionEvent(payload);
     const isTargeted = Boolean(targetConnIds);
     if (shouldLogWs()) {
       const logMeta: Record<string, unknown> = {
@@ -210,7 +229,7 @@ export function createGatewayBroadcaster(params: {
       if (targetConnIds && !targetConnIds.has(c.connId)) {
         continue;
       }
-      if (!hasEventScope(c, event, explicitPluginScope)) {
+      if (!hasEventScope(c, event, explicitPluginScope, adminOnly)) {
         continue;
       }
       if (

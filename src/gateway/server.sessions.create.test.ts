@@ -39,6 +39,7 @@ import {
   agentDiscoveryMock,
   dispatchInboundMessageMock,
   embeddedRunMock,
+  onceMessage,
   rpcReq,
   testState,
   writeSessionStore,
@@ -388,6 +389,116 @@ test("incognito sessions survive non-default-agent webchat reply initialization"
     ).toBeUndefined();
   } finally {
     ws.close();
+    closeOpenClawAgentDatabasesForTest();
+  }
+});
+
+test("incognito operator RPCs are visible only to admin-scope connections", async () => {
+  const { dir } = await createSessionStoreDir();
+  const admin = await openClient({
+    scopes: ["operator.admin"],
+    deviceIdentityPath: path.join(dir, "admin-device.json"),
+  });
+  const reader = await openClient({
+    scopes: ["operator.read"],
+    deviceIdentityPath: path.join(dir, "reader-device.json"),
+  });
+  const writer = await openClient({
+    scopes: ["operator.write"],
+    deviceIdentityPath: path.join(dir, "writer-device.json"),
+  });
+  try {
+    const created = await rpcReq<{ key?: string; sessionId?: string }>(
+      admin.ws,
+      "sessions.create",
+      { agentId: "main", incognito: true },
+    );
+    expect(created.ok, JSON.stringify(created.error)).toBe(true);
+    const sessionKey = requireNonEmptyString(created.payload?.key, "admin incognito key");
+
+    const adminList = await rpcReq<{ sessions?: Array<{ key?: string }> }>(
+      admin.ws,
+      "sessions.list",
+      {},
+    );
+    expect(adminList.payload?.sessions?.some((session) => session.key === sessionKey)).toBe(true);
+
+    for (const ws of [admin.ws, reader.ws, writer.ws]) {
+      await expect(rpcReq(ws, "sessions.subscribe", {})).resolves.toMatchObject({ ok: true });
+    }
+    for (const ws of [reader.ws, writer.ws]) {
+      const listed = await rpcReq<{ sessions?: Array<{ key?: string }> }>(ws, "sessions.list", {});
+      expect(listed.ok).toBe(true);
+      expect(listed.payload?.sessions?.some((session) => session.key === sessionKey)).toBe(false);
+    }
+
+    const deniedCreate = await rpcReq(writer.ws, "sessions.create", {
+      agentId: "main",
+      incognito: true,
+    });
+    expect(deniedCreate).toMatchObject({
+      ok: false,
+      error: { message: "missing scope: operator.admin" },
+    });
+
+    const unknownError = {
+      code: "INVALID_REQUEST",
+      message: `Incognito session "${sessionKey}" was not found.`,
+    };
+    await expect(rpcReq(reader.ws, "sessions.get", { key: sessionKey })).resolves.toMatchObject({
+      ok: false,
+      error: unknownError,
+    });
+    await expect(
+      rpcReq(writer.ws, "chat.send", {
+        sessionKey,
+        message: "must stay invisible",
+        idempotencyKey: "non-admin-incognito-send",
+      }),
+    ).resolves.toMatchObject({ ok: false, error: unknownError });
+    await expect(rpcReq(writer.ws, "sessions.delete", { key: sessionKey })).resolves.toMatchObject({
+      ok: false,
+      error: unknownError,
+    });
+
+    const nonAdminEvents: Array<{ event?: string; payload?: { sessionKey?: string } }> = [];
+    const collectNonAdminEvent = (data: { toString: () => string }) => {
+      const message = JSON.parse(data.toString()) as {
+        event?: string;
+        payload?: { sessionKey?: string };
+        type?: string;
+      };
+      if (message.type === "event") {
+        nonAdminEvents.push(message);
+      }
+    };
+    reader.ws.on("message", collectNonAdminEvent);
+    writer.ws.on("message", collectNonAdminEvent);
+    const adminChanged = onceMessage(
+      admin.ws,
+      (message) =>
+        message.type === "event" &&
+        message.event === "sessions.changed" &&
+        (message.payload as { sessionKey?: unknown } | undefined)?.sessionKey === sessionKey,
+    );
+    const patched = await rpcReq(admin.ws, "sessions.patch", {
+      key: sessionKey,
+      label: "admin-only",
+    });
+    expect(patched.ok, JSON.stringify(patched.error)).toBe(true);
+    await adminChanged;
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+    expect(
+      nonAdminEvents.some(
+        (event) => event.event === "sessions.changed" && event.payload?.sessionKey === sessionKey,
+      ),
+    ).toBe(false);
+  } finally {
+    admin.ws.close();
+    reader.ws.close();
+    writer.ws.close();
     closeOpenClawAgentDatabasesForTest();
   }
 });

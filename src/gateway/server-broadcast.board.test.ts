@@ -56,4 +56,21 @@ describe("board event scope guards", () => {
     expect(write.socket.events).toEqual(["board.changed", "board.command"]);
     expect(admin.socket.events).toEqual(["board.changed", "board.command"]);
   });
+
+  it("delivers incognito session events only to admin operators", () => {
+    const read = makeClient("read", "operator", ["operator.read"]);
+    const write = makeClient("write", "operator", ["operator.write"]);
+    const admin = makeClient("admin", "operator", ["operator.admin"]);
+    const clients = new Set([read.client, write.client, admin.client]);
+    const { broadcast } = createGatewayBroadcaster({ clients });
+
+    broadcast("sessions.changed", {
+      sessionKey: "agent:main:dashboard:incognito-private",
+      reason: "patch",
+    });
+
+    expect(read.socket.events).toEqual([]);
+    expect(write.socket.events).toEqual([]);
+    expect(admin.socket.events).toEqual(["sessions.changed"]);
+  });
 });

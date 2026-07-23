@@ -14,6 +14,7 @@ import {
   isGatewayRestartDraining,
   tryBeginGatewayRootWorkAdmission,
 } from "../process/gateway-work-admission.js";
+import { isIncognitoSessionKey } from "../routing/session-key.js";
 import { formatControlPlaneActor, resolveControlPlaneActor } from "./control-plane-audit.js";
 import {
   consumeControlPlaneWriteBudget,
@@ -339,6 +340,15 @@ function authorizeGatewayMethod(
   if (scopes.includes(ADMIN_SCOPE)) {
     return null;
   }
+  const incognitoSessionKey = resolveNonAdminIncognitoAccessKey(method, params);
+  if (incognitoSessionKey) {
+    // Returning the stale-key refusal hides whether a process-only session is live
+    // and keeps non-admin callers out before any handler resolves its state.
+    return errorShape(
+      ErrorCodes.INVALID_REQUEST,
+      `Incognito session "${incognitoSessionKey}" was not found.`,
+    );
+  }
   const registeredScope = methodRegistry.getScope(method);
   const scopeAuth = isOperatorScope(registeredScope)
     ? authorizeOperatorScopesForRequiredScope(registeredScope, scopes)
@@ -354,6 +364,32 @@ function authorizeGatewayMethod(
     });
   }
   return null;
+}
+
+function resolveNonAdminIncognitoAccessKey(method: string, params: unknown): string | undefined {
+  if (method === "sessions.create" || method === "sessions.list") {
+    return undefined;
+  }
+  if (!params || typeof params !== "object" || Array.isArray(params)) {
+    return undefined;
+  }
+  const record = params as {
+    key?: unknown;
+    keys?: unknown;
+    sessionKey?: unknown;
+    sessionKeys?: unknown;
+  };
+  const candidates = [record.key, record.sessionKey];
+  if (Array.isArray(record.keys)) {
+    candidates.push(...record.keys);
+  }
+  if (Array.isArray(record.sessionKeys)) {
+    candidates.push(...record.sessionKeys);
+  }
+  return candidates.find(
+    (candidate): candidate is string =>
+      typeof candidate === "string" && isIncognitoSessionKey(candidate),
+  );
 }
 
 const SUSPEND_CONTROL_METHODS = new Set([
