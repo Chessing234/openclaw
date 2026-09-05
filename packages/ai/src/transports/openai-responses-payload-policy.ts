@@ -397,8 +397,7 @@ export function resolveOpenAIResponsesPayloadPolicy(
   // ChatGPT Codex Responses rejects omitted `store` and requires an explicit
   // `store: false` (native codex path already does this; transport path must too).
   const requiresExplicitStoreFalse =
-    api === "openai-chatgpt-responses" ||
-    api === "openclaw-openai-chatgpt-responses-transport";
+    api === "openai-chatgpt-responses" || api === "openclaw-openai-chatgpt-responses-transport";
   const explicitStore =
     storeMode === "preserve"
       ? undefined
