@@ -51,7 +51,10 @@ import {
 } from "../agents/tools/cron-tool.js";
 import { createChannelQuestionPromptDelivery } from "../agents/tools/question-prompt-send.js";
 import { prepareSessionPortalToolTarget } from "../agents/tools/session-portal-target.js";
-import { hasSessionControlAuthority } from "../agents/tools/sessions-control-authority.js";
+import {
+  hasSessionControlAuthority,
+  prepareSandboxSessionRename,
+} from "../agents/tools/sessions-operator-authority.js";
 import type { SourceReplyDeliveryMode } from "../auto-reply/get-reply-options.types.js";
 import type { ConversationReadInvocationOrigin } from "../channels/plugins/conversation-read-origin.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -212,6 +215,11 @@ export function resolveGatewayScopedTools(
     senderName: params.senderName,
     senderUsername: params.senderUsername,
     senderE164: params.senderE164,
+    inputProvenance: params.inputProvenance,
+    trustedInternalHandoff: params.trustedInternalHandoff,
+    sessionId: params.sessionId,
+    modelProvider: params.modelProvider,
+    modelId: params.modelId,
     senderPolicyMode: params.scheduledToolPolicy
       ? "never"
       : nodeExecSurface
@@ -223,6 +231,12 @@ export function resolveGatewayScopedTools(
     requireConfiguredGroupAccount: params.scheduledToolPolicy?.mode === "account",
   });
   const { groupPolicy, senderPolicy, subagentPolicy, inheritedToolPolicy } = requesterPolicies;
+  if (
+    params.trustedInternalHandoff &&
+    requesterPolicies.requesterPolicySource !== "completion-handoff"
+  ) {
+    throw new Error("CLI completion tool grant no longer matches its requester policy");
+  }
   const sandboxRuntime = resolveSandboxRuntimeStatus({
     cfg: params.cfg,
     sessionKey: params.sessionKey,
@@ -233,11 +247,19 @@ export function resolveGatewayScopedTools(
   const sandboxed = params.rootedExecution
     ? Boolean(params.rootedExecution.sandbox)
     : sandboxRuntime.sandboxed;
-  const sandboxPolicy = params.rootedExecution
+  const preparedSandboxPolicy = params.rootedExecution
     ? params.rootedExecution.sandbox?.tools
     : sandboxRuntime.sandboxed
       ? sandboxRuntime.toolPolicy
       : undefined;
+  const sessionControlAuthority = readAdmittedRunOperatorAuthority(params.admittedRunContext);
+  const { policy: sandboxPolicy, renameOnly: sandboxSessionRenameOnly } =
+    prepareSandboxSessionRename({
+      policy: preparedSandboxPolicy,
+      senderIsOwner:
+        surface === "loopback" && params.admittedRunContext ? params.senderIsOwner : undefined,
+      authority: sessionControlAuthority,
+    });
   const excludedToolNames = params.excludeToolNames ? Array.from(params.excludeToolNames) : [];
   const mediatedToolNames = new Set(
     Array.from(params.mediatedToolNames ?? [], (name) => normalizeToolPolicyName(name)).filter(
@@ -268,7 +290,6 @@ export function resolveGatewayScopedTools(
     surface === "loopback" &&
     params.admittedRunContext &&
     getAdmittedRunDelegatedAuthority(params.admittedRunContext);
-  const sessionControlAuthority = readAdmittedRunOperatorAuthority(params.admittedRunContext);
   const ownerOnlyGatewayDeny = [
     ...(params.senderIsOwner === false || (surface === "http" && params.senderIsOwner !== true)
       ? GATEWAY_OWNER_ONLY_CORE_TOOLS.filter(
@@ -332,6 +353,7 @@ export function resolveGatewayScopedTools(
   // bound to that same collector session.
   const swarmCollectorAdmission = {
     childSessionKey: params.sessionKey,
+    childAgentId: sessionAgentId,
     admittedRunId: surface === "loopback" ? params.runId : undefined,
   };
   const swarmCollectorContext = resolveSwarmCollectorToolContext(swarmCollectorAdmission);
@@ -409,6 +431,7 @@ export function resolveGatewayScopedTools(
     senderIsOwner: params.senderIsOwner,
     requesterSenderId: senderId,
     sessionControlAuthority,
+    sandboxSessionRenameOnly,
     conversationReadOrigin: params.conversationReadOrigin,
     allowGatewaySubagentBinding: params.allowGatewaySubagentBinding,
     skillWorkshop: params.skillWorkshop,
@@ -513,6 +536,8 @@ export function resolveGatewayScopedTools(
           senderUsername: params.senderUsername,
           senderE164: params.senderE164,
           senderIsOwner: params.senderIsOwner,
+          inputProvenance: params.inputProvenance,
+          trustedInternalHandoff: params.trustedInternalHandoff,
           trigger: params.trigger,
           approvalReviewerDeviceId: params.approvalReviewerDeviceId,
           sourceReplyDeliveryMode,

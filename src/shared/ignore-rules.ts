@@ -31,20 +31,6 @@ function normalizeLiteralSubtreePath(pathname: string): string {
   return posixPath.endsWith("/") ? posixPath.slice(0, -1) : posixPath;
 }
 
-function setContainsLiteralSubtree(pathname: string, subtrees: Set<string>): boolean {
-  for (const subtree of subtrees) {
-    if (!subtree || pathname === subtree || pathname.startsWith(`${subtree}/`)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function isInLiteralSubtree(pathname: string, state: IgnoreMatcherState): boolean {
-  const normalized = normalizeLiteralSubtreePath(pathname).toLowerCase();
-  return setContainsLiteralSubtree(normalized, state.excludedSubtrees);
-}
-
 function getIgnoreMatcherState(matcher?: IgnoreMatcher): IgnoreMatcherState {
   if (matcher) {
     const existing = ignoreMatcherStates.get(matcher);
@@ -65,7 +51,13 @@ function getIgnoreMatcherState(matcher?: IgnoreMatcher): IgnoreMatcherState {
   const originalIgnores = ownedMatcher.ignores.bind(ownedMatcher);
   ownedMatcher.ignores = (pathname: string) => {
     const ignored = originalIgnores(pathname);
-    return isInLiteralSubtree(pathname, state) || ignored;
+    const normalized = normalizeLiteralSubtreePath(pathname).toLowerCase();
+    for (const subtree of state.excludedSubtrees) {
+      if (!subtree || normalized === subtree || normalized.startsWith(`${subtree}/`)) {
+        return true;
+      }
+    }
+    return ignored;
   };
   return state;
 }
@@ -193,6 +185,7 @@ function prefixIgnorePattern(line: string, prefix: string): string {
   const depthGlob = prefix && !anchored && !matchPattern.slice(0, -1).includes("/") ? "**/" : "";
   // The containing directory is a literal path, even when its name uses ignore syntax.
   const literalPrefix = prefix.replace(/[\\*?[\]#!]/g, "\\$&");
-  const prefixed = `${literalPrefix}${depthGlob}${normalized}`;
+  // At the scan root, keep the leading slash so anchored rules stay top-level only.
+  const prefixed = prefix ? `${literalPrefix}${depthGlob}${normalized}` : pattern;
   return negated ? `!${prefixed}` : prefixed;
 }

@@ -7,8 +7,8 @@ import {
   normalizeSessionDeliveryState,
   upsertSessionEntry,
 } from "openclaw/plugin-sdk/session-store-runtime";
-import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { useSessionStoreTempDirs } from "openclaw/plugin-sdk/sqlite-runtime-testing";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import {
   createArgMenusHarness,
   createSlashCommand,
@@ -34,6 +34,7 @@ function createPolicyHarness(overrides?: {
   channelName?: string;
   allowFrom?: string[];
   useAccessGroups?: boolean;
+  channelAllowed?: boolean;
   slashEphemeral?: boolean;
   slashCommandEnabled?: boolean;
   slashCommandName?: string;
@@ -102,7 +103,7 @@ function createPolicyHarness(overrides?: {
     },
     textLimit: 4000,
     app,
-    isChannelAllowed: () => true,
+    isChannelAllowed: vi.fn(() => overrides?.channelAllowed ?? true),
     shouldDropMismatchedSlackEvent: (body: unknown) =>
       overrides?.shouldDropMismatchedSlackEvent?.(body) ?? false,
     resolveChannelName:
@@ -251,46 +252,17 @@ describe("slack slash commands channel policy", () => {
     expect(respond).not.toHaveBeenCalled();
   });
 
-  it.each<{
-    name: string;
-    policy: NonNullable<Parameters<typeof createPolicyHarness>[0]>;
-    blocked: boolean;
-  }>([
-    {
-      name: "allows unlisted channels when groupPolicy is open",
-      policy: {
-        groupPolicy: "open",
-        channelsConfig: { C_LISTED: { requireMention: true } },
-        channelId: "C_UNLISTED",
-        channelName: "unlisted",
-      },
-      blocked: false,
-    },
-    {
-      name: "blocks explicitly denied channels when groupPolicy is open",
-      policy: {
-        groupPolicy: "open",
-        channelsConfig: { C_DENIED: { enabled: false } },
-        channelId: "C_DENIED",
-        channelName: "denied",
-      },
-      blocked: true,
-    },
-    {
-      name: "blocks unlisted channels when groupPolicy is allowlist",
-      policy: {
-        groupPolicy: "allowlist",
-        channelsConfig: { C_LISTED: { requireMention: true } },
-        channelId: "C_UNLISTED",
-        channelName: "unlisted",
-      },
-      blocked: true,
-    },
-  ])("$name", async ({ policy, blocked }) => {
-    const harness = createPolicyHarness(policy);
+  it.each([true, false])("honors monitor channel admission: allowed=%s", async (allowed) => {
+    const harness = createPolicyHarness({ channelAllowed: allowed });
     const { respond } = await registerAndRunPolicySlash({ harness });
 
-    if (blocked) {
+    expect(harness.ctx.isChannelAllowed).toHaveBeenCalledWith({
+      teamId: "T1",
+      channelId: "C_UNLISTED",
+      channelName: "unlisted",
+      channelType: "channel",
+    });
+    if (!allowed) {
       expectChannelBlockedResponse(respond);
       return;
     }
@@ -359,22 +331,6 @@ describe("slack slash commands access groups", () => {
     expect(dispatchArg?.ctx?.CommandAuthorized).toBe(true);
   });
 
-  it("classifies MPIM slash commands as group chat context", async () => {
-    const harness = createPolicyHarness({
-      channelId: "G_MPIM",
-      channelName: "group-dm",
-      resolveChannelName: async () => ({ name: "group-dm", type: "mpim" }),
-    });
-    await registerAndRunPolicySlash({ harness });
-
-    expect(dispatchMock).toHaveBeenCalledTimes(1);
-    const dispatchArg = firstDispatchArg() as {
-      ctx?: { ChatType?: string; From?: string };
-    };
-    expect(dispatchArg?.ctx?.ChatType).toBe("group");
-    expect(dispatchArg?.ctx?.From).toBe("slack:group:G_MPIM");
-  });
-
   it.each([
     {
       name: "blocks MPIM slash commands from senders outside the configured allowFrom",
@@ -411,6 +367,10 @@ describe("slack slash commands access groups", () => {
     expect(responseTexts(respond)).not.toContain(
       "You are not authorized to use this command here.",
     );
+    expect(firstDispatchArg().ctx).toMatchObject({
+      ChatType: "group",
+      From: "slack:group:G_MPIM",
+    });
   });
 
   it("enforces access-group gating when lookup fails for private channels", async () => {
@@ -427,7 +387,7 @@ describe("slack slash commands access groups", () => {
 });
 
 describe("slack slash command session metadata", () => {
-  const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+  const tempDirs = useSessionStoreTempDirs(afterAll, "slack-threaded-stop-");
   const { deliverSlackSlashRepliesMock, recordSessionMetaFromInboundMock, resolveAgentRouteMock } =
     getSlackSlashMocks();
 
@@ -435,7 +395,7 @@ describe("slack slash command session metadata", () => {
     const { createInboundSlackTestContext, createSlackTestAccount } =
       await import("./message-handler/prepare.test-helpers.js");
     const { createSlackCommandHandler } = await import("./slash.js");
-    const storePath = path.join(tempDirs.make("slack-threaded-stop-"), "sessions.sqlite");
+    const storePath = path.join(tempDirs.make(), "sessions.sqlite");
     const cfg: OpenClawConfig = {
       session: { store: storePath },
       channels: { slack: { dmPolicy: "open", allowFrom: ["*"] } },
@@ -523,45 +483,25 @@ describe("slack slash command session metadata", () => {
     }));
     await registerCommands(ctx, harness.account);
 
-    await runSlashHandler({
-      commands: harness.commands,
-      command: {
-        channel_id: harness.channelId,
-        channel_name: harness.channelName,
-      },
-    });
+    const run = () =>
+      runSlashHandler({
+        commands: harness.commands,
+        command: { channel_id: harness.channelId, channel_name: harness.channelName },
+      });
+    await run();
     setRuntimeConfigSnapshot(runtimeCfg, runtimeCfg);
-    await runSlashHandler({
-      commands: harness.commands,
-      command: {
-        channel_id: harness.channelId,
-        channel_name: harness.channelName,
-      },
-    });
+    await run();
 
-    expect(dispatchMock).toHaveBeenNthCalledWith(
-      1,
-      expect.objectContaining({
-        ctx: expect.objectContaining({ CommandTargetSessionKey: "agent:main:main" }),
-      }),
-    );
-    expect(dispatchMock).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({
-        ctx: expect.objectContaining({
-          CommandTargetSessionKey: "agent:main:slack:direct:U1",
-        }),
-      }),
-    );
+    expect(dispatchMock.mock.calls.map(([turn]) => turn.ctx.CommandTargetSessionKey)).toEqual([
+      "agent:main:main",
+      "agent:main:slack:direct:U1",
+    ]);
     const disabled: OpenClawConfig = {
       ...runtimeCfg,
       channels: { slack: { dmPolicy: "disabled" } },
     };
     setRuntimeConfigSnapshot(disabled, disabled);
-    await runSlashHandler({
-      commands: harness.commands,
-      command: { channel_id: harness.channelId, channel_name: harness.channelName },
-    });
+    await run();
     expect(dispatchMock).toHaveBeenCalledTimes(2);
   });
 
