@@ -1,6 +1,6 @@
-// Discord plugin module implements listeners behavior.
 import {
   GatewayDispatchEvents,
+  type APIInteraction,
   type APIMessage,
   type APIReaction,
   type APIUnavailableGuild,
@@ -8,6 +8,7 @@ import {
   type GatewayGuildCreateDispatchData,
   type GatewayGuildDeleteDispatchData,
   type GatewayPresenceUpdateDispatchData,
+  type GatewayThreadDeleteDispatchData,
   type GatewayThreadUpdateDispatchData,
 } from "discord-api-types/v10";
 import type { Client } from "./client.js";
@@ -77,6 +78,7 @@ export abstract class MessageCreateListener extends BaseListener {
 
 export abstract class InteractionCreateListener extends BaseListener {
   readonly type = GatewayDispatchEvents.InteractionCreate;
+  abstract override handle(data: APIInteraction, client: Client): Promise<void> | void;
 }
 
 export abstract class MessageReactionAddListener extends BaseListener {
@@ -106,6 +108,14 @@ export abstract class ThreadUpdateListener extends BaseListener {
   readonly type = GatewayDispatchEvents.ThreadUpdate;
   abstract override handle(
     data: GatewayThreadUpdateDispatchData,
+    client: Client,
+  ): Promise<void> | void;
+}
+
+export abstract class ThreadDeleteListener extends BaseListener {
+  readonly type = GatewayDispatchEvents.ThreadDelete;
+  abstract override handle(
+    data: GatewayThreadDeleteDispatchData,
     client: Client,
   ): Promise<void> | void;
 }

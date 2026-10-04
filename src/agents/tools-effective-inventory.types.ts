@@ -5,6 +5,8 @@
  */
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { ProviderRuntimeModel } from "../plugins/provider-runtime-model.types.js";
+import type { ResolvedConversationCapabilityProfile } from "./conversation-capability-profile.js";
+import type { ToolAccessDiagnostics } from "./tool-access-diagnostics.js";
 
 /** Source bucket for an effective agent tool inventory entry. */
 export type EffectiveToolSource = "core" | "plugin" | "channel" | "mcp";
@@ -38,6 +40,7 @@ export type EffectiveToolInventoryNotice = {
   id: string;
   severity: "info" | "warning";
   message: string;
+  servers?: string[];
 };
 
 /** Effective tool inventory result for one agent/profile. */
@@ -46,13 +49,16 @@ export type EffectiveToolInventoryResult = {
   profile: string;
   groups: EffectiveToolInventoryGroup[];
   notices?: EffectiveToolInventoryNotice[];
+  toolAccess?: ToolAccessDiagnostics;
 };
 
 /** Inputs for resolving the effective tool inventory in a session/runtime context. */
 export type ResolveEffectiveToolInventoryParams = {
   cfg: OpenClawConfig;
+  conversationCapabilityProfile?: ResolvedConversationCapabilityProfile;
   agentId?: string;
   sessionKey?: string;
+  sessionId?: string;
   workspaceDir?: string;
   agentDir?: string;
   messageProvider?: string;

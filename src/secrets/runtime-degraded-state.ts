@@ -8,6 +8,7 @@ import {
 
 export type SecretDegradationReason =
   | SecretResolutionFailureReason
+  | "secret provider is not configured"
   | "resolved secret value was invalid"
   | "secret reference is not allowed for this provider"
   | "secret reference was not materialized by the active runtime"
@@ -108,12 +109,14 @@ export function classifySecretResolutionErrorDegradations(error: unknown): Secre
 export function redactSecretDegradationReason(reason: string): SecretDegradationReason {
   switch (reason) {
     case "secret provider failed":
+    case "secret provider is not configured":
     case "secret provider policy denied resolution":
     case "secret provider response violated its contract":
     case "secret reference is not allowed for this provider":
     case "secret reference was not found":
     case "secret reference was not materialized by the active runtime":
     case "resolved secret value was invalid":
+    case "resolved secret value is a redaction placeholder":
     case "secret resolution failed":
       return reason;
     default:
@@ -122,6 +125,7 @@ export function redactSecretDegradationReason(reason: string): SecretDegradation
 }
 
 const SECRET_SURFACE_UNAVAILABLE_ERROR_CODE = "SECRET_SURFACE_UNAVAILABLE";
+const trustedSecretSurfaceUnavailableErrors = new WeakSet<object>();
 
 /** Runtime error returned when a request targets an isolated SecretRef owner. */
 export class SecretSurfaceUnavailableError extends Error {
@@ -138,7 +142,17 @@ export class SecretSurfaceUnavailableError extends Error {
     this.ownerKind = owner.ownerKind;
     this.ownerId = owner.ownerId;
     this.paths = [...owner.paths];
+    trustedSecretSurfaceUnavailableErrors.add(this);
   }
+}
+
+/** Authenticates owner-created failures without trusting forgeable error names or prototypes. */
+export function isTrustedSecretSurfaceUnavailableError(
+  error: unknown,
+): error is SecretSurfaceUnavailableError {
+  return (
+    typeof error === "object" && error !== null && trustedSecretSurfaceUnavailableErrors.has(error)
+  );
 }
 
 let activeDegradedOwners: DegradedSecretOwner[] = [];
@@ -149,7 +163,7 @@ function ownerKey(ownerKind: DegradedSecretOwner["ownerKind"], ownerId: string):
   return `${ownerKind}\0${ownerId}`;
 }
 
-function cloneOwner(owner: DegradedSecretOwner): DegradedSecretOwner {
+function cloneOwner<T extends DegradedSecretOwner>(owner: T): T {
   return {
     ...owner,
     paths: [...owner.paths],
@@ -157,24 +171,24 @@ function cloneOwner(owner: DegradedSecretOwner): DegradedSecretOwner {
   };
 }
 
-function cloneResolutionErrorOwner(owner: SecretResolutionErrorOwner): SecretResolutionErrorOwner {
-  return {
-    ...cloneOwner(owner),
-    degradationState: owner.degradationState,
-    failureMatched: owner.failureMatched,
-    source: owner.source,
-  };
-}
-
 /** Publishes the degraded-owner snapshot at the same edge as runtime config activation. */
 export function setActiveDegradedSecretOwners(owners: readonly DegradedSecretOwner[]): void {
   activeDegradedOwners = owners.map(cloneOwner);
-  activeCredentialDegradedOwners.clear();
 }
 
-/** Publishes or clears one runtime-discovered channel credential owner. */
+/** Publishes one runtime-discovered channel credential owner. */
 export function setActiveCredentialDegradedOwner(owner: DegradedSecretOwner): void {
   activeCredentialDegradedOwners.set(ownerKey(owner.ownerKind, owner.ownerId), cloneOwner(owner));
+}
+
+/** Lists credential owners independently of the replaceable SecretRef snapshot. */
+export function listActiveCredentialDegradedOwners(): DegradedSecretOwner[] {
+  return Array.from(activeCredentialDegradedOwners.values(), cloneOwner);
+}
+
+/** Clears credential-owner state only when its owning secrets runtime is torn down. */
+export function clearActiveCredentialDegradedOwners(): void {
+  activeCredentialDegradedOwners.clear();
 }
 
 /** Clears one runtime-discovered channel credential owner before re-inspection. */
@@ -187,10 +201,7 @@ export function clearActiveCredentialDegradedOwner(
 
 /** Returns the active degraded-owner snapshot without exposing mutable registry state. */
 export function listActiveDegradedSecretOwners(): DegradedSecretOwner[] {
-  return [
-    ...activeDegradedOwners.map(cloneOwner),
-    ...Array.from(activeCredentialDegradedOwners.values(), cloneOwner),
-  ];
+  return [...activeDegradedOwners.map(cloneOwner), ...listActiveCredentialDegradedOwners()];
 }
 
 /** Associates a strict activation failure with the owners it prevented from refreshing. */
@@ -201,7 +212,7 @@ export function associateSecretResolutionErrorOwners(
   if ((typeof error !== "object" && typeof error !== "function") || error === null) {
     return;
   }
-  resolutionErrorOwners.set(error, owners.map(cloneResolutionErrorOwner));
+  resolutionErrorOwners.set(error, owners.map(cloneOwner));
 }
 
 /** Returns owner metadata recorded for a strict activation failure. */
@@ -209,7 +220,7 @@ export function listSecretResolutionErrorOwners(error: unknown): SecretResolutio
   if ((typeof error !== "object" && typeof error !== "function") || error === null) {
     return [];
   }
-  return (resolutionErrorOwners.get(error) ?? []).map(cloneResolutionErrorOwner);
+  return (resolutionErrorOwners.get(error) ?? []).map(cloneOwner);
 }
 
 /** Returns one active degraded owner, if present. */
@@ -236,4 +247,12 @@ export function assertSecretOwnerAvailable(
   if (owner) {
     throw new SecretSurfaceUnavailableError(owner);
   }
+}
+
+/** Returns whether an owner is available without activating or resolving its secrets. */
+export function isSecretOwnerAvailable(
+  ownerKind: DegradedSecretOwner["ownerKind"],
+  ownerId: string,
+): boolean {
+  return findActiveDegradedSecretOwner(ownerKind, ownerId) === undefined;
 }

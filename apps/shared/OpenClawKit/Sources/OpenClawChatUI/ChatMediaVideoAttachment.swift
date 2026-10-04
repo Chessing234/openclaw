@@ -9,6 +9,7 @@ import UniformTypeIdentifiers
 struct ChatMediaVideoAttachment: View {
     private enum LoadState {
         case loading
+        case preparing
         case loaded(ChatMediaVideoPlayer)
         case unavailable
     }
@@ -28,14 +29,9 @@ struct ChatMediaVideoAttachment: View {
         Group {
             switch self.state {
             case .loading:
-                HStack(spacing: 8) {
-                    ProgressView()
-                    Text(String(localized: "Loading video…"))
-                        .font(OpenClawChatTypography.footnote)
-                        .foregroundStyle(.secondary)
-                }
-                .frame(minHeight: self.reservedHeight)
-                .frame(maxWidth: .infinity)
+                self.waitingCard(String(localized: "Loading video…"))
+            case .preparing:
+                self.waitingCard(String(localized: "Preparing playback…"))
             case let .loaded(player):
                 self.playerCard(player)
             case .unavailable:
@@ -50,6 +46,17 @@ struct ChatMediaVideoAttachment: View {
                 player.cleanup()
             }
         }
+    }
+
+    private func waitingCard(_ message: String) -> some View {
+        HStack(spacing: 8) {
+            ProgressView()
+            Text(message)
+                .font(OpenClawChatTypography.footnote)
+                .foregroundStyle(.secondary)
+        }
+        .frame(minHeight: self.reservedHeight)
+        .frame(maxWidth: .infinity)
     }
 
     @ViewBuilder
@@ -137,12 +144,16 @@ struct ChatMediaVideoAttachment: View {
         }
         self.state = .loading
         do {
-            guard let loaded = try await self.load(self.artifactId), !Task.isCancelled else {
+            let loaded = try await ChatMediaPlaybackLoader.load(
+                request: { try await self.load(self.artifactId) },
+                onPreparing: { self.state = .preparing })
+            guard let loaded, !Task.isCancelled else {
                 if !Task.isCancelled { self.state = .unavailable }
                 return
             }
             let player = try await ChatMediaVideoPlayer(
                 loaded: loaded,
+                title: self.label,
                 playbackAllowed: self.playbackAllowed)
             guard !Task.isCancelled else {
                 player.cleanup()
@@ -160,18 +171,20 @@ struct ChatMediaVideoAttachment: View {
 
 @MainActor
 @Observable
-final class ChatMediaVideoPlayer: ChatMediaPlaybackOwner {
+final class ChatMediaVideoPlayer: ChatMediaNowPlayingOwner {
     let player: AVPlayer
     private(set) var isPlaying = false
     private(set) var isPlaybackBlocked = false
     private(set) var isUnavailable = false
 
     @ObservationIgnored private let playbackAllowed: @MainActor @Sendable () -> Bool
+    @ObservationIgnored private let title: String
     @ObservationIgnored private let temporaryFileURL: URL?
     @ObservationIgnored private var statusTask: Task<Void, Never>?
 
     init(
         loaded: OpenClawChatLoadedMedia,
+        title: String,
         playbackAllowed: @escaping @MainActor @Sendable () -> Bool) async throws
     {
         let playbackURL: URL
@@ -187,8 +200,11 @@ final class ChatMediaVideoPlayer: ChatMediaPlaybackOwner {
             let fileURL = try await Self.writeTemporaryVideo(media)
             playbackURL = fileURL
             temporaryFileURL = fileURL
+        case .preparing:
+            throw ChatMediaVideoError.playbackStillPreparing
         }
         self.player = AVPlayer(url: playbackURL)
+        self.title = title
         self.playbackAllowed = playbackAllowed
         self.temporaryFileURL = temporaryFileURL
         self.startStatusUpdates()
@@ -203,11 +219,41 @@ final class ChatMediaVideoPlayer: ChatMediaPlaybackOwner {
         ChatMediaPlaybackCoordinator.shared.activate(self)
         self.rewindIfFinished()
         self.player.play()
+        self.isPlaying = true
+        ChatMediaPlaybackCoordinator.shared.updateNowPlaying(self)
     }
 
     func stopForMediaPlaybackInterruption() {
+        self.pause()
+    }
+
+    func pause() {
         self.player.pause()
         self.isPlaying = false
+        ChatMediaPlaybackCoordinator.shared.updateNowPlaying(self)
+    }
+
+    var nowPlayingMetadata: ChatMediaNowPlayingMetadata {
+        let duration = self.player.currentItem?.duration.seconds ?? 0
+        let elapsed = self.player.currentTime().seconds
+        return ChatMediaNowPlayingMetadata(
+            title: self.title,
+            duration: duration.isFinite && duration > 0 ? duration : 0,
+            elapsed: elapsed.isFinite && elapsed > 0 ? elapsed : 0,
+            playbackRate: self.isPlaying ? 1 : 0)
+    }
+
+    func handleRemoteCommand(_ command: ChatMediaRemoteCommand) {
+        switch command {
+        case .play: self.play()
+        case .pause: self.pause()
+        case .toggle:
+            if self.isPlaying {
+                self.pause()
+            } else {
+                self.play()
+            }
+        }
     }
 
     func cleanup() {
@@ -250,22 +296,26 @@ final class ChatMediaVideoPlayer: ChatMediaPlaybackOwner {
                     self.isPlaybackBlocked = false
                     ChatMediaPlaybackCoordinator.shared.activate(self)
                 } else if !playing, self.isPlaying {
-                    self.rewindIfFinished()
-                    ChatMediaPlaybackCoordinator.shared.release(self)
+                    if self.rewindIfFinished() {
+                        ChatMediaPlaybackCoordinator.shared.release(self)
+                    }
                 }
                 self.isPlaying = playing
+                ChatMediaPlaybackCoordinator.shared.updateNowPlaying(self)
             }
         }
     }
 
-    private func rewindIfFinished() {
-        guard let item = self.player.currentItem else { return }
+    @discardableResult
+    private func rewindIfFinished() -> Bool {
+        guard let item = self.player.currentItem else { return false }
         let duration = item.duration.seconds
         let currentTime = self.player.currentTime().seconds
         guard duration.isFinite, duration > 0, currentTime.isFinite,
               currentTime >= duration - 0.05
-        else { return }
+        else { return false }
         self.player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
+        return true
     }
 
     private func fail() {
@@ -293,4 +343,5 @@ final class ChatMediaVideoPlayer: ChatMediaPlaybackOwner {
 
 private enum ChatMediaVideoError: Error {
     case unsupportedMediaType
+    case playbackStillPreparing
 }

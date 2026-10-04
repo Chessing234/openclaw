@@ -1,4 +1,3 @@
-// Whatsapp plugin module implements durable receive behavior.
 import { createHash } from "node:crypto";
 import type { WAMessage } from "baileys";
 import {
@@ -49,7 +48,10 @@ function hashNamespacePart(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 24);
 }
 
-function createWhatsAppDurableInboundMessageId(params: { remoteJid: string; id: string }): string {
+export function createWhatsAppDurableInboundMessageId(params: {
+  remoteJid: string;
+  id: string;
+}): string {
   return createHash("sha256").update(`${params.remoteJid}\n${params.id}`).digest("hex");
 }
 
@@ -132,13 +134,13 @@ export function createWhatsAppIngressMonitor(params: {
     deliver: (admission, lifecycle) => params.dispatch(admission, lifecycle),
     pollIntervalMs: params.pollIntervalMs,
     retention: {
-      pendingTtlMs: 30 * 24 * 60 * 60 * 1_000,
-      pendingMaxEntries: 450,
       completedTtlMs: 7 * 24 * 60 * 60 * 1_000,
       completedMaxEntries: 5_000,
       failedMaxEntries: 450,
     },
     drain: {
+      // Debounce candidates share a reply lane, but retain separate durable claims.
+      deferredLaneOccupancy: "release",
       resolveNonRetryableFailure: resolveWhatsAppIngressNonRetryableFailure,
       deriveLaneKey: (record) => {
         try {

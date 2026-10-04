@@ -1,4 +1,3 @@
-/** Creates and seeds the attempt-local trajectory recorder. */
 import type { SessionSystemPromptReport } from "../../../config/sessions/types.js";
 import { buildTrajectoryRunMetadata } from "../../../trajectory/metadata.js";
 import { createTrajectoryRuntimeRecorder } from "../../../trajectory/runtime.js";
@@ -25,6 +24,9 @@ export async function prepareEmbeddedAttemptTrajectory(input: {
     sessionKey: attempt.sessionKey,
     sessionTarget: attempt.sessionTarget,
   });
+  if (attempt.disableTrajectory || attempt.sessionPersistence === "detached") {
+    return null;
+  }
   const sessionTarget =
     attempt.sessionTarget?.agentId &&
     attempt.sessionTarget.sessionId &&
@@ -37,21 +39,19 @@ export async function prepareEmbeddedAttemptTrajectory(input: {
           storePath: attempt.sessionTarget.storePath,
         }
       : undefined;
-  const recorder = attempt.disableTrajectory
-    ? null
-    : createTrajectoryRuntimeRecorder({
-        cfg: attempt.config,
-        env: process.env,
-        runId: attempt.runId,
-        sessionId: activeSession.sessionId,
-        sessionKey: attempt.sessionKey,
-        sessionFile: trajectorySessionFile,
-        sessionTarget,
-        provider: attempt.provider,
-        modelId: attempt.modelId,
-        modelApi: attempt.model.api,
-        workspaceDir: attempt.workspaceDir,
-      });
+  const recorder = createTrajectoryRuntimeRecorder({
+    cfg: attempt.config,
+    env: process.env,
+    runId: attempt.runId,
+    sessionId: activeSession.sessionId,
+    sessionKey: attempt.sessionKey,
+    sessionFile: trajectorySessionFile,
+    sessionTarget,
+    provider: attempt.provider,
+    modelId: attempt.modelId,
+    modelApi: attempt.model.api,
+    workspaceDir: attempt.workspaceDir,
+  });
   recorder?.recordEvent("session.started", {
     trigger: attempt.trigger,
     sessionFile: attempt.sessionFile,
@@ -69,6 +69,9 @@ export async function prepareEmbeddedAttemptTrajectory(input: {
     buildTrajectoryRunMetadata({
       env: process.env,
       config: attempt.config,
+      ...(attempt.preparedModelRuntime?.metadataSnapshot
+        ? { pluginMetadataSnapshot: attempt.preparedModelRuntime.metadataSnapshot }
+        : {}),
       workspaceDir: input.effectiveWorkspace,
       sessionFile: attempt.sessionFile,
       sessionKey: attempt.sessionKey,

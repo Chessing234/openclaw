@@ -1,4 +1,3 @@
-// Presents model-proposed follow-up tasks that belong to the active TUI session.
 import {
   SelectList,
   Text,
@@ -6,11 +5,14 @@ import {
   type OverlayHandle,
   type SelectItem,
 } from "@earendil-works/pi-tui";
+import { asOptionalObjectRecord } from "@openclaw/normalization-core/record-coerce";
 import type { TaskSuggestion } from "../../packages/gateway-protocol/src/index.js";
 import { formatErrorMessage } from "../infra/errors.js";
-import { selectListTheme, theme } from "./theme/theme.js";
+import { createTuiRefreshCoalescer } from "./coalesced-refresh.js";
+import { selectListTheme, tuiTheme as theme } from "./theme/theme.js";
 import type { TuiBackend } from "./tui-backend.js";
 import { sanitizeRenderableText } from "./tui-formatters.js";
+import { matchesOwnedTuiSession } from "./tui-session-events.js";
 
 type TaskSelector = Component & {
   onSelect?: (item: SelectItem) => void;
@@ -43,18 +45,20 @@ const TASK_DETAIL_PAGE_LINES = TASK_DETAIL_VIEWPORT_LINES - 1;
 const PAGE_UP_INPUT = "\u001b[5~";
 const PAGE_DOWN_INPUT = "\u001b[6~";
 
+type TaskAction = SelectItem & { value: "accept" | "dismiss" };
+
 const TASK_ACTIONS = [
   {
     value: "accept",
-    label: "Start in worktree",
-    description: "Create an isolated session and begin this task",
+    label: "Start in a new session",
+    description: "Open a new session to address this task",
   },
   {
     value: "dismiss",
     label: "Dismiss",
-    description: "Leave the repository untouched",
+    description: "Dismiss this suggestion without starting work",
   },
-] satisfies SelectItem[];
+] as const satisfies readonly TaskAction[];
 
 function clean(text: string): string {
   return sanitizeTaskText(text.replace(/\s+/g, " ").trim());
@@ -64,42 +68,35 @@ function sanitizeTaskText(text: string): string {
   return sanitizeRenderableText(text.replace(TASK_BIDI_CONTROL_RE, ""));
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
-/** Parses the task suggestion shape carried by Gateway list and event payloads. */
 function parseTuiTaskSuggestion(value: unknown): TaskSuggestion | null {
-  if (!isRecord(value)) {
+  const record = asOptionalObjectRecord(value);
+  if (!record) {
     return null;
   }
   const required = ["id", "title", "prompt", "tldr", "cwd", "sessionKey"] as const;
-  if (required.some((field) => typeof value[field] !== "string" || !value[field].trim())) {
+  if (required.some((field) => typeof record[field] !== "string" || !record[field].trim())) {
     return null;
   }
-  if (typeof value.createdAt !== "number" || value.createdAt < 0) {
+  if (typeof record.createdAt !== "number" || record.createdAt < 0) {
     return null;
   }
   return {
-    id: (value.id as string).trim(),
-    title: (value.title as string).trim(),
-    prompt: (value.prompt as string).trim(),
-    tldr: (value.tldr as string).trim(),
-    cwd: (value.cwd as string).trim(),
-    sessionKey: (value.sessionKey as string).trim(),
-    ...(typeof value.agentId === "string" && value.agentId.trim()
-      ? { agentId: value.agentId.trim() }
+    id: (record.id as string).trim(),
+    title: (record.title as string).trim(),
+    prompt: (record.prompt as string).trim(),
+    tldr: (record.tldr as string).trim(),
+    cwd: (record.cwd as string).trim(),
+    sessionKey: (record.sessionKey as string).trim(),
+    ...(typeof record.agentId === "string" && record.agentId.trim()
+      ? { agentId: record.agentId.trim() }
       : {}),
-    createdAt: value.createdAt,
+    createdAt: record.createdAt,
   };
 }
 
 class TaskPrompt implements Component {
   private readonly title: Text;
-  private readonly metadata: Text;
-  private readonly summary: Text;
-  private readonly instructionLabel = new Text(theme.system("Instructions:"));
-  private readonly instructions: Text;
+  private readonly details: Text[];
   private readonly detailPosition = new Text();
   private readonly confirmation = new Text();
   private detailOffset = 0;
@@ -111,9 +108,12 @@ class TaskPrompt implements Component {
     private readonly requestRender: () => void,
   ) {
     this.title = new Text(theme.header(`Suggested follow-up: ${clean(suggestion.title)}`));
-    this.metadata = new Text(theme.dim(`Project: ${clean(suggestion.cwd)}`));
-    this.summary = new Text(theme.system(`Why: ${clean(suggestion.tldr)}`));
-    this.instructions = new Text(theme.system(sanitizeTaskText(suggestion.prompt.trim())));
+    this.details = [
+      new Text(theme.dim(`Project: ${clean(suggestion.cwd)}`)),
+      new Text(theme.system(`Why: ${clean(suggestion.tldr)}`)),
+      new Text(theme.system("Instructions:")),
+      new Text(theme.system(sanitizeTaskText(suggestion.prompt.trim()))),
+    ];
   }
 
   setConfirmation(text: string): void {
@@ -123,10 +123,7 @@ class TaskPrompt implements Component {
   invalidate(): void {
     for (const component of [
       this.title,
-      this.metadata,
-      this.summary,
-      this.instructionLabel,
-      this.instructions,
+      ...this.details,
       this.detailPosition,
       this.confirmation,
       this.selector,
@@ -138,12 +135,7 @@ class TaskPrompt implements Component {
   render(width: number): string[] {
     // Page the complete confirmation details as one unit. This keeps actions
     // visible without hiding a long project-path suffix from the operator.
-    const detailLines = [
-      ...this.metadata.render(width),
-      ...this.summary.render(width),
-      ...this.instructionLabel.render(width),
-      ...this.instructions.render(width),
-    ];
+    const detailLines = this.details.flatMap((component) => component.render(width));
     this.detailLineCount = detailLines.length;
     const maxDetailOffset = Math.max(0, detailLines.length - TASK_DETAIL_VIEWPORT_LINES);
     this.detailOffset = Math.min(this.detailOffset, maxDetailOffset);
@@ -180,10 +172,9 @@ class TaskPrompt implements Component {
       const nextOffset = Math.min(maxOffset, Math.max(0, this.detailOffset + delta));
       if (nextOffset !== this.detailOffset) {
         this.detailOffset = nextOffset;
-        this.metadata.invalidate();
-        this.summary.invalidate();
-        this.instructionLabel.invalidate();
-        this.instructions.invalidate();
+        for (const component of this.details) {
+          component.invalidate();
+        }
         this.requestRender();
       }
       return;
@@ -192,21 +183,19 @@ class TaskPrompt implements Component {
   }
 }
 
-/** Coordinates Gateway task-suggestion events with the active TUI overlay. */
 export function createTuiTaskSuggestionController(deps: TaskSuggestionControllerDeps) {
   const createSelector =
     deps.createSelector ??
     ((items: SelectItem[]) => new SelectList(items, items.length, selectListTheme));
   const suggestions = new Map<string, TaskSuggestion>();
   const hiddenIds = new Set<string>();
+  const resolvingIds = new Set<string>();
   let activeId: string | null = null;
   let activeOverlay: OverlayHandle | null = null;
   let activeSelector: TaskSelector | null = null;
   let activeActionKey: string | null = null;
   let revision = 0;
   let disposed = false;
-  let refreshInFlight: Promise<void> | null = null;
-  let refreshAgain = false;
 
   const closeActive = () => {
     if (activeOverlay) {
@@ -228,8 +217,7 @@ export function createTuiTaskSuggestionController(deps: TaskSuggestionController
   };
 
   const matchesSession = (suggestion: TaskSuggestion) =>
-    suggestion.sessionKey === deps.getSessionKey() &&
-    (suggestion.sessionKey !== "global" || suggestion.agentId === deps.getAgentId());
+    matchesOwnedTuiSession(deps.getSessionKey(), deps.getAgentId(), suggestion);
 
   const availableActions = () => {
     const capabilities = deps.client.getTaskSuggestionActionCapabilities?.() ?? {
@@ -255,12 +243,10 @@ export function createTuiTaskSuggestionController(deps: TaskSuggestionController
     }
     const suggestion = [...suggestions.values()]
       .toSorted((left, right) => left.createdAt - right.createdAt)
-      .find((entry) => !hiddenIds.has(entry.id) && matchesSession(entry));
-    if (!suggestion) {
-      return;
-    }
-
-    if (actions.length === 0) {
+      .find(
+        (entry) => !hiddenIds.has(entry.id) && !resolvingIds.has(entry.id) && matchesSession(entry),
+      );
+    if (!suggestion || actions.length === 0) {
       return;
     }
 
@@ -271,26 +257,24 @@ export function createTuiTaskSuggestionController(deps: TaskSuggestionController
     const dismissIndex = actions.findIndex((action) => action.value === "dismiss");
     selector.setSelectedIndex?.(Math.max(dismissIndex, 0));
     let acceptArmed = false;
-    let prompt: TaskPrompt | null = null;
+    const prompt = new TaskPrompt(suggestion, selector, deps.requestRender);
 
-    const resolve = async (action: "accept" | "dismiss") => {
+    const resolve = async (action: TaskAction) => {
       if (activeId !== suggestion.id || activeSelector !== selector) {
         return;
       }
       closeActive();
-      hiddenIds.add(suggestion.id);
+      // Navigation clears manual dismissals, not ownership of an unfinished action.
+      resolvingIds.add(suggestion.id);
       deps.requestRender();
       try {
-        if (action === "accept") {
+        let acceptedKey: string | undefined;
+        if (action.value === "accept") {
           if (!deps.client.acceptTaskSuggestion) {
             throw new Error("task suggestion acceptance is unavailable");
           }
           const result = await deps.client.acceptTaskSuggestion(suggestion.id);
-          remove(suggestion.id);
-          deps.chatLog.addSystem(`follow-up task started in ${result.key}`);
-          if (matchesSession(suggestion)) {
-            await deps.onAccepted(result.key);
-          }
+          acceptedKey = result.key;
         } else {
           if (!deps.client.dismissTaskSuggestion) {
             throw new Error("task suggestion dismissal is unavailable");
@@ -299,17 +283,31 @@ export function createTuiTaskSuggestionController(deps: TaskSuggestionController
           if (!result.dismissed) {
             throw new Error("task suggestion is no longer pending");
           }
-          remove(suggestion.id);
-          deps.chatLog.addSystem("follow-up task dismissed");
+        }
+        if (disposed) {
+          return;
+        }
+        remove(suggestion.id);
+        deps.chatLog.addSystem(
+          acceptedKey ? `follow-up task started in ${acceptedKey}` : "follow-up task dismissed",
+        );
+        if (acceptedKey && matchesSession(suggestion)) {
+          await deps.onAccepted(acceptedKey);
         }
       } catch (error) {
-        hiddenIds.delete(suggestion.id);
+        if (disposed) {
+          return;
+        }
         deps.chatLog.addSystem(`follow-up task failed: ${formatErrorMessage(error)}`);
         void refresh().catch((refreshError: unknown) => {
-          deps.chatLog.addSystem(
-            `task suggestion refresh failed: ${formatErrorMessage(refreshError)}`,
-          );
+          if (!disposed) {
+            deps.chatLog.addSystem(
+              `task suggestion refresh failed: ${formatErrorMessage(refreshError)}`,
+            );
+          }
         });
+      } finally {
+        resolvingIds.delete(suggestion.id);
       }
       presentNext();
       if (!disposed) {
@@ -319,31 +317,25 @@ export function createTuiTaskSuggestionController(deps: TaskSuggestionController
 
     selector.onSelectionChange = () => {
       acceptArmed = false;
-      prompt?.setConfirmation("");
+      prompt.setConfirmation("");
     };
     selector.onSelect = (item) => {
       if (activeSelector !== selector) {
         return;
       }
-      if (!availableActions().some((action) => action.value === item.value)) {
+      const selectedAction = actions.find((action) => action.value === item.value);
+      if (!selectedAction || !availableActions().some((action) => action.value === item.value)) {
         closeActive();
         presentNext();
         deps.requestRender();
         return;
       }
-      if (item.value === "dismiss") {
-        void resolve("dismiss");
-        return;
-      }
-      if (item.value !== "accept") {
-        return;
-      }
-      if (acceptArmed) {
-        void resolve("accept");
+      if (selectedAction.value === "dismiss" || acceptArmed) {
+        void resolve(selectedAction);
         return;
       }
       acceptArmed = true;
-      prompt?.setConfirmation("Press Enter again to start this task in a worktree.");
+      prompt.setConfirmation("Press Enter again to start this task.");
       deps.requestRender();
     };
     selector.onCancel = () => {
@@ -356,65 +348,60 @@ export function createTuiTaskSuggestionController(deps: TaskSuggestionController
       presentNext();
       deps.requestRender();
     };
-    prompt = new TaskPrompt(suggestion, selector, deps.requestRender);
     activeOverlay = deps.openOverlay(prompt);
     deps.requestRender();
   };
 
-  const refresh = async (): Promise<void> => {
-    if (disposed || !deps.client.listTaskSuggestions) {
-      return;
-    }
-    if (refreshInFlight) {
-      refreshAgain = true;
-      return await refreshInFlight;
-    }
-    refreshInFlight = (async () => {
-      do {
-        refreshAgain = false;
-        const startRevision = revision;
-        const listed = await deps.client.listTaskSuggestions?.();
-        if (disposed || !listed) {
-          return;
+  const refreshRunner = createTuiRefreshCoalescer(
+    async (requestRerun) => {
+      const startRevision = revision;
+      const listed = await deps.client.listTaskSuggestions?.();
+      if (disposed || !listed) {
+        return false;
+      }
+      // An event raced this snapshot. Retry instead of resurrecting resolved work.
+      if (revision !== startRevision) {
+        requestRerun();
+        return true;
+      }
+      suggestions.clear();
+      for (const value of listed) {
+        const suggestion = parseTuiTaskSuggestion(value);
+        if (suggestion) {
+          suggestions.set(suggestion.id, suggestion);
         }
-        // An event raced this snapshot. Retry instead of resurrecting resolved work.
-        if (revision !== startRevision) {
-          refreshAgain = true;
-          continue;
+      }
+      for (const id of hiddenIds) {
+        if (!suggestions.has(id)) {
+          hiddenIds.delete(id);
         }
-        suggestions.clear();
-        for (const value of listed) {
-          const suggestion = parseTuiTaskSuggestion(value);
-          if (suggestion) {
-            suggestions.set(suggestion.id, suggestion);
-          }
-        }
-        for (const id of hiddenIds) {
-          if (!suggestions.has(id)) {
-            hiddenIds.delete(id);
-          }
-        }
-      } while (refreshAgain);
+      }
+      return true;
+    },
+    () => {
       if (activeId && !suggestions.has(activeId)) {
         closeActive();
       }
       presentNext();
       deps.requestRender();
-    })();
-    try {
-      await refreshInFlight;
-    } finally {
-      refreshInFlight = null;
+    },
+  );
+
+  const refresh = async (): Promise<void> => {
+    if (disposed || !deps.client.listTaskSuggestions) {
+      return;
     }
+    await refreshRunner.run();
   };
 
   return {
     handleEvent(event: string, payload: unknown) {
-      if (disposed || event !== "task.suggestion" || !isRecord(payload)) {
+      const record = asOptionalObjectRecord(payload);
+      if (disposed || event !== "task.suggestion" || !record) {
         return;
       }
-      if (payload.action === "created") {
-        const suggestion = parseTuiTaskSuggestion(payload.suggestion);
+      if (record.action === "created") {
+        const suggestion = parseTuiTaskSuggestion(record.suggestion);
         if (suggestion) {
           revision += 1;
           hiddenIds.delete(suggestion.id);
@@ -423,8 +410,8 @@ export function createTuiTaskSuggestionController(deps: TaskSuggestionController
         }
         return;
       }
-      if (payload.action === "resolved" && typeof payload.taskId === "string") {
-        remove(payload.taskId);
+      if (record.action === "resolved" && typeof record.taskId === "string") {
+        remove(record.taskId);
         presentNext();
         deps.requestRender();
       }

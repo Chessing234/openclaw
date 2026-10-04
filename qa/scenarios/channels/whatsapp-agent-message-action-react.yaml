@@ -11,8 +11,10 @@ scenario:
     timeoutMs: 90000
     retryCount: 1
     suiteIsolation: isolated
-    config: { whatsappScenarioId: whatsapp-agent-message-action-react }
+    config:
+      whatsappScenario: whatsappQaAgentMessageActionReactScenario
 flow:
   module: ./live-transports/whatsapp/scenario-runtime.js
-  call: runWhatsAppAgentMessageActionReactScenario
-  args: [{ expr: whatsappScenarioContext }]
+  call: runWhatsAppScenario
+  args:
+    - { expr: whatsappScenarioContext }

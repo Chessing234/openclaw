@@ -11,8 +11,10 @@ scenario:
     timeoutMs: 120000
     retryCount: 1
     suiteIsolation: isolated
-    config: { whatsappScenarioId: whatsapp-group-activation-always }
+    config:
+      whatsappScenario: whatsappQaGroupActivationAlwaysScenario
 flow:
   module: ./live-transports/whatsapp/scenario-runtime.js
-  call: runWhatsAppGroupActivationAlwaysScenario
-  args: [{ expr: whatsappScenarioContext }]
+  call: runWhatsAppScenario
+  args:
+    - { expr: whatsappScenarioContext }

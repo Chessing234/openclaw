@@ -1,16 +1,34 @@
 import fs from "node:fs/promises";
+import { withTempWorkspace } from "@openclaw/fs-safe/temp";
 import type { MediaKind } from "@openclaw/media-core/constants";
-import { withTempWorkspace } from "../infra/private-temp-workspace.js";
+import {
+  asPositiveSafeInteger as parsePositiveInteger,
+  asSafeIntegerInRange,
+} from "@openclaw/normalization-core/number-coercion";
+import { asOptionalRecord as readRecord } from "@openclaw/normalization-core/record-coerce";
+import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
 import { resolvePreferredOpenClawTmpDir } from "../infra/tmp-openclaw-dir.js";
 import { runFfprobe } from "./ffmpeg-exec.js";
 
 export type MediaProbeKind = Extract<MediaKind, "audio" | "video">;
 
-/** Best-effort metadata reported by one bounded ffprobe invocation. */
+/** Best-effort duration and display dimensions from one bounded ffprobe invocation. */
 export type MediaProbeResult = {
   durationMs?: number;
   width?: number;
   height?: number;
+};
+
+/** Encoded stream dimensions and codec facts used to validate playback renditions. */
+export type PlaybackMediaProbeResult = MediaProbeResult & {
+  audioCodec?: string;
+  audioStreamIndex?: number;
+  videoCodec?: string;
+  videoPixelFormat?: string;
+  videoProfile?: string;
+  videoRotation?: number;
+  videoSampleAspectRatio?: number;
+  videoStreamIndex?: number;
 };
 
 type MediaProbeOptions = {
@@ -28,11 +46,7 @@ type MediaProbeBatchOptions = {
   maxProbes: number;
 };
 
-type FfprobeSource = { kind: "fileDescriptor"; fd: number } | { kind: "buffer"; buffer: Buffer };
-
-function parsePositiveInteger(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
-}
+type FfprobeSource = { stdinFileDescriptor: number } | { input: Buffer };
 
 function parseDurationMs(value: unknown): number | undefined {
   if (typeof value !== "number" && typeof value !== "string") {
@@ -45,63 +59,88 @@ function parseDurationMs(value: unknown): number | undefined {
   return parsePositiveInteger(Math.round(seconds * 1000));
 }
 
-function readRecord(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
+function selectPlaybackStream(
+  streams: readonly Record<string, unknown>[],
+  codecType: "audio" | "video",
+): Record<string, unknown> | undefined {
+  const candidates = streams.filter((stream) => {
+    if (stream.codec_type !== codecType) {
+      return false;
+    }
+    const disposition = readRecord(stream.disposition);
+    return codecType !== "video" || disposition?.attached_pic !== 1;
+  });
+  return (
+    candidates.find((stream) => readRecord(stream.disposition)?.default === 1) ?? candidates[0]
+  );
 }
 
-function parseFfprobeMediaMetadata(stdout: string, kind: MediaProbeKind): MediaProbeResult {
+function parseFfprobeMediaMetadata(
+  stdout: string,
+  kind: MediaProbeKind,
+): PlaybackMediaProbeResult | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(stdout);
   } catch {
-    return {};
+    return null;
   }
   const root = readRecord(parsed);
   if (!root) {
-    return {};
+    return null;
   }
   const format = readRecord(root.format);
-  const streams = Array.isArray(root.streams) ? root.streams : [];
-  const stream = readRecord(streams[0]);
-  const durationMs = parseDurationMs(format?.duration) ?? parseDurationMs(stream?.duration);
-  if (kind === "audio") {
-    return durationMs ? { durationMs } : {};
-  }
-  const width = parsePositiveInteger(stream?.width);
-  const height = parsePositiveInteger(stream?.height);
+  const streams = (Array.isArray(root.streams) ? root.streams : [])
+    .map(readRecord)
+    .filter((stream): stream is Record<string, unknown> => Boolean(stream));
+  const audioStream = selectPlaybackStream(streams, "audio");
+  const videoStream = selectPlaybackStream(streams, "video");
+  const selectedDurations = (kind === "video" ? [videoStream, audioStream] : [audioStream])
+    .map((stream) => parseDurationMs(stream?.duration))
+    .filter((duration): duration is number => duration !== undefined);
+  const durationMs =
+    (selectedDurations.length > 0 ? Math.max(...selectedDurations) : undefined) ??
+    parseDurationMs(format?.duration);
+  const width = parsePositiveInteger(videoStream?.width);
+  const height = parsePositiveInteger(videoStream?.height);
+  const [sarWidth, sarHeight] =
+    typeof videoStream?.sample_aspect_ratio === "string"
+      ? videoStream.sample_aspect_ratio
+          .split(":")
+          .map((value) => parsePositiveInteger(Number(value)))
+      : [];
+  const videoSampleAspectRatio = sarWidth && sarHeight ? sarWidth / sarHeight : undefined;
+  const videoRotation = (
+    Array.isArray(videoStream?.side_data_list) ? videoStream.side_data_list : []
+  )
+    .map((sideData) => asSafeIntegerInRange(readRecord(sideData)?.rotation, {}))
+    .find((rotation) => rotation !== undefined);
+  const audioCodec = normalizeOptionalLowercaseString(audioStream?.codec_name);
+  const videoCodec = normalizeOptionalLowercaseString(videoStream?.codec_name);
+  const videoPixelFormat = normalizeOptionalLowercaseString(videoStream?.pix_fmt);
+  const videoProfile = normalizeOptionalLowercaseString(videoStream?.profile);
+  const audioStreamIndex = asSafeIntegerInRange(audioStream?.index, { min: 0 });
+  const videoStreamIndex = asSafeIntegerInRange(videoStream?.index, { min: 0 });
   return {
     ...(durationMs ? { durationMs } : {}),
-    ...(width && height ? { width, height } : {}),
+    ...(kind === "video" && width && height ? { width, height } : {}),
+    ...(videoRotation !== undefined ? { videoRotation } : {}),
+    ...(videoSampleAspectRatio !== undefined ? { videoSampleAspectRatio } : {}),
+    ...(audioCodec ? { audioCodec } : {}),
+    ...(audioStreamIndex !== undefined ? { audioStreamIndex } : {}),
+    ...(videoCodec ? { videoCodec } : {}),
+    ...(videoPixelFormat ? { videoPixelFormat } : {}),
+    ...(videoProfile ? { videoProfile } : {}),
+    ...(videoStreamIndex !== undefined ? { videoStreamIndex } : {}),
   };
 }
 
-function buildFfprobeMetadataArgs(kind: MediaProbeKind, protocol: "fd" | "pipe"): string[] {
-  const isFileDescriptor = protocol === "fd";
-  return [
-    "-v",
-    "error",
-    "-select_streams",
-    kind === "video" ? "v:0" : "a:0",
-    "-protocol_whitelist",
-    protocol,
-    "-show_entries",
-    "format=duration:stream=duration,width,height",
-    "-of",
-    "json",
-    ...(isFileDescriptor ? ["-fd", "0"] : []),
-    isFileDescriptor ? "fd:" : "pipe:0",
-  ];
-}
-
 function isMissingFdProtocolError(error: unknown): boolean {
-  if (!error || typeof error !== "object") {
-    return false;
-  }
-  const stderr = (error as { stderr?: unknown }).stderr;
+  const stderr = readRecord(error)?.stderr;
   const message = typeof stderr === "string" ? stderr : error instanceof Error ? error.message : "";
-  return /(?:fd:.*protocol not found|protocol not found.*fd|unrecognized option ['"]?fd|option fd not found)/is.test(
+  // ffprobe < 6.0 (no fd: protocol, e.g. 4.4 and 5.1) rejects `-fd` with
+  // "Failed to set value '0' for option 'fd': Option not found".
+  return /(?:fd:.*protocol not found|protocol not found.*fd|unrecognized option ['"]?fd|option ['"]?fd\b.*not found)/is.test(
     message,
   );
 }
@@ -110,27 +149,59 @@ async function probeMediaSource(
   source: FfprobeSource,
   kind: MediaProbeKind,
   options: MediaProbeOptions = {},
-): Promise<MediaProbeResult> {
+): Promise<PlaybackMediaProbeResult | null> {
+  const isFileDescriptor = "stdinFileDescriptor" in source;
   const runProbe = async (protocol: "fd" | "pipe") =>
     await runFfprobe(
-      buildFfprobeMetadataArgs(kind, protocol),
-      source.kind === "buffer"
-        ? { input: source.buffer, ...options }
-        : { stdinFileDescriptor: source.fd, ...options },
+      [
+        "-v",
+        "error",
+        "-protocol_whitelist",
+        protocol,
+        "-show_entries",
+        "format=duration:stream=index,codec_type,codec_name,profile,pix_fmt,duration,width,height,sample_aspect_ratio:stream_disposition=default,attached_pic:stream_side_data=rotation",
+        "-of",
+        "json",
+        ...(protocol === "fd" ? ["-fd", "0"] : []),
+        protocol === "fd" ? "fd:" : "pipe:0",
+      ],
+      { ...source, ...options },
     );
   try {
-    const stdout = await runProbe(source.kind === "fileDescriptor" ? "fd" : "pipe");
+    const stdout = await runProbe(isFileDescriptor ? "fd" : "pipe");
     return parseFfprobeMediaMetadata(stdout, kind);
   } catch (error) {
-    if (source.kind === "fileDescriptor" && isMissingFdProtocolError(error)) {
+    if (isFileDescriptor && isMissingFdProtocolError(error)) {
       try {
         return parseFfprobeMediaMetadata(await runProbe("pipe"), kind);
       } catch {
-        return {};
+        return null;
       }
     }
+    return null;
+  }
+}
+
+/** Keep encoded playback facts separate from attachment display dimensions. */
+export function toMediaProbeResult(result: PlaybackMediaProbeResult | null): MediaProbeResult {
+  if (!result) {
     return {};
   }
+  const swapsAxes = Math.abs(result.videoRotation ?? 0) % 180 === 90;
+  // Non-square pixels change display width before rotation; playback keeps encoded axes.
+  const width =
+    result.width &&
+    (parsePositiveInteger(Math.round(result.width * (result.videoSampleAspectRatio ?? 1))) ??
+      result.width);
+  return {
+    ...(result.durationMs ? { durationMs: result.durationMs } : {}),
+    ...(width && result.height
+      ? {
+          width: swapsAxes ? result.height : width,
+          height: swapsAxes ? width : result.height,
+        }
+      : {}),
+  };
 }
 
 /** Probes a local audio or video file; every failure degrades to absent fields. */
@@ -142,7 +213,9 @@ async function probeMediaFile(
   try {
     const handle = await fs.open(filePath, "r");
     try {
-      return await probeMediaSource({ kind: "fileDescriptor", fd: handle.fd }, kind, options);
+      return toMediaProbeResult(
+        await probeMediaSource({ stdinFileDescriptor: handle.fd }, kind, options),
+      );
     } finally {
       await handle.close().catch(() => {});
     }
@@ -151,16 +224,16 @@ async function probeMediaFile(
   }
 }
 
-/** Probes a bounded local-file batch under one shared wall-clock budget. */
+/** Probes a bounded batch under one elapsed-time budget, unaffected by wall-clock steps. */
 export async function probeMediaFilesWithinBudget(
   inputs: readonly MediaFileProbeInput[],
   options: MediaProbeBatchOptions,
 ): Promise<MediaProbeResult[]> {
   const results: MediaProbeResult[] = inputs.map(() => ({}));
-  const deadlineMs = Date.now() + options.budgetMs;
+  const deadlineMs = performance.now() + options.budgetMs;
   const probeCount = Math.min(inputs.length, options.maxProbes);
   for (let offset = 0; offset < probeCount; offset += options.concurrency) {
-    const timeoutMs = deadlineMs - Date.now();
+    const timeoutMs = deadlineMs - performance.now();
     if (timeoutMs <= 0) {
       break;
     }
@@ -176,34 +249,27 @@ export async function probeMediaFilesWithinBudget(
   return results;
 }
 
-/** Probes the exact file identity already validated and opened by a security boundary. */
-export async function probeMediaFileDescriptor(
+/** Probes duration and first-stream codecs from an already validated local descriptor. */
+export async function probePlaybackMediaFileDescriptor(
   fd: number,
   kind: MediaProbeKind,
   options: MediaProbeOptions = {},
-): Promise<MediaProbeResult> {
-  return await probeMediaSource({ kind: "fileDescriptor", fd }, kind, options);
+): Promise<PlaybackMediaProbeResult | null> {
+  return await probeMediaSource({ stdinFileDescriptor: fd }, kind, options);
 }
 
-/** Positive video dimensions reported by ffprobe for the first video stream. */
 type VideoDimensions = {
   width: number;
   height: number;
 };
 
-/**
- * Probes a video buffer via a seekable temp file. Pipe:0 probing fails for
- * large MP4s because ffprobe needs to seek the MOOV atom (often at the end for
- * faststart files), which is impossible over a non-seekable stdin pipe.
- */
+/** Probes a video buffer while preserving the existing public media-runtime API. */
 export async function probeVideoDimensions(buffer: Buffer): Promise<VideoDimensions | undefined> {
   try {
     return await withTempWorkspace(
-      {
-        rootDir: resolvePreferredOpenClawTmpDir(),
-        prefix: "openclaw-ffprobe-",
-      },
+      { rootDir: resolvePreferredOpenClawTmpDir(), prefix: "openclaw-ffprobe-" },
       async (workspace) => {
+        // A seekable descriptor lets ffprobe read MP4 metadata at the end of the file.
         const tempPath = await workspace.write("video.bin", buffer);
         const { width, height } = await probeMediaFile(tempPath, "video");
         return width && height ? { width, height } : undefined;

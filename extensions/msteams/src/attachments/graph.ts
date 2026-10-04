@@ -1,8 +1,13 @@
-// Msteams plugin module implements graph behavior.
+import { coerceErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import {
   readProviderJsonArrayFieldResponse,
   readProviderJsonResponse,
 } from "openclaw/plugin-sdk/provider-http";
+import { resolveRequestUrl } from "openclaw/plugin-sdk/request-url";
+import {
+  buildHostnameAllowlistPolicyFromSuffixAllowlist as resolveMediaSsrfPolicy,
+  isHttpsUrlAllowedByHostnameSuffixAllowlist as isUrlAllowed,
+} from "openclaw/plugin-sdk/ssrf-policy";
 import { fetchWithSsrFGuard, type SsrFPolicy } from "openclaw/plugin-sdk/ssrf-runtime";
 import {
   normalizeLowercaseStringOrEmpty,
@@ -22,15 +27,12 @@ import {
   applyAuthorizationHeaderForUrl,
   encodeGraphShareId,
   GRAPH_ROOT,
-  isUrlAllowed,
   type MSTeamsAttachmentDownloadLogger,
   type MSTeamsAttachmentFetchPolicy,
   type MSTeamsAttachmentResolveFn,
   normalizeContentType,
   resolveMSTeamsMediaKind,
-  resolveMediaSsrfPolicy,
   resolveAttachmentFetchPolicy,
-  resolveRequestUrl,
   safeFetchWithPolicy,
 } from "./shared.js";
 import type {
@@ -53,15 +55,6 @@ function createGraphHostedContentFact(item: GraphHostedContent): MSTeamsInboundM
     ...(item.id ? { sourceId: item.id } : {}),
   };
 }
-
-type GraphAttachment = {
-  id?: string | null;
-  contentType?: string | null;
-  contentUrl?: string | null;
-  name?: string | null;
-  thumbnailUrl?: string | null;
-  content?: unknown;
-};
 
 export function buildMSTeamsGraphMessageUrl(params: {
   conversationType?: string | null;
@@ -99,6 +92,13 @@ export function buildMSTeamsGraphMessageUrl(params: {
   return `${GRAPH_ROOT}/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}`;
 }
 
+async function releaseGraphResponse(response: Response, release: () => Promise<void>) {
+  if (!response.bodyUsed) {
+    void response.body?.cancel().catch(() => undefined); // Awaiting capture tees can deadlock.
+  }
+  await release();
+}
+
 async function fetchGraphCollection(params: {
   url: string;
   accessToken: string;
@@ -120,7 +120,6 @@ async function fetchGraphCollection(params: {
   try {
     const status = response.status;
     if (!response.ok) {
-      await response.body?.cancel().catch(() => undefined);
       return { status, items: [] };
     }
     try {
@@ -134,11 +133,11 @@ async function fetchGraphCollection(params: {
       return { status, items: [] };
     }
   } finally {
-    await release();
+    await releaseGraphResponse(response, release);
   }
 }
 
-function normalizeGraphAttachment(att: GraphAttachment): MSTeamsAttachmentLike {
+function normalizeGraphAttachment(att: MSTeamsAttachmentLike): MSTeamsAttachmentLike {
   let content: unknown = att.content;
   if (typeof content === "string") {
     try {
@@ -157,16 +156,11 @@ function normalizeGraphAttachment(att: GraphAttachment): MSTeamsAttachmentLike {
   };
 }
 
-/**
- * Download all hosted content from a Teams message (images, documents, etc.).
- * Renamed from downloadGraphHostedImages to support all file types.
- */
 async function downloadGraphHostedContent(params: {
   accessToken: string;
   messageUrl: string;
   maxBytes: number;
   fetchFn?: typeof fetch;
-  preserveFilenames?: boolean;
   ssrfPolicy?: SsrFPolicy;
   logger?: MSTeamsAttachmentDownloadLogger;
   deadline?: MSTeamsRequestDeadline;
@@ -182,7 +176,7 @@ async function downloadGraphHostedContent(params: {
     })) as { status: number; items: GraphHostedContent[] };
   } catch (err) {
     params.logger?.warn?.("msteams graph hostedContents fetch failed", {
-      error: err instanceof Error ? err.message : String(err),
+      error: coerceErrorMessage(err),
     });
     return { media: [], count: 0 };
   }
@@ -229,12 +223,12 @@ async function downloadGraphHostedContent(params: {
           sourceId: item.id,
         });
       } finally {
-        await release();
+        await releaseGraphResponse(valRes, release);
       }
     } catch (err) {
       out.push(createGraphHostedContentFact(item));
       params.logger?.warn?.("msteams graph hostedContent value fetch failed", {
-        error: err instanceof Error ? err.message : String(err),
+        error: coerceErrorMessage(err),
       });
       continue;
     }
@@ -278,10 +272,10 @@ export async function downloadMSTeamsGraphMedia(params: {
   } catch (err) {
     params.logger?.debug?.("graph media token acquisition failed", {
       messageUrl,
-      error: err instanceof Error ? err.message : String(err),
+      error: coerceErrorMessage(err),
     });
     params.logger?.warn?.("msteams graph token acquisition failed", {
-      error: err instanceof Error ? err.message : String(err),
+      error: coerceErrorMessage(err),
     });
     return { media: [], messageUrl, tokenError: true };
   }
@@ -289,8 +283,8 @@ export async function downloadMSTeamsGraphMedia(params: {
   const fetchFn = params.fetchFn ?? fetch;
   const sharePointMedia: MSTeamsInboundMedia[] = [];
   const downloadedReferenceUrls = new Set<string>();
-  let messageAttachments: GraphAttachment[] = [];
-  let referenceAttachments: GraphAttachment[] = [];
+  let messageAttachments: MSTeamsAttachmentLike[] = [];
+  let referenceAttachments: MSTeamsAttachmentLike[] = [];
   let messageStatus: number | undefined;
   try {
     const { response: msgRes, release } = await fetchWithSsrFGuard({
@@ -308,7 +302,7 @@ export async function downloadMSTeamsGraphMedia(params: {
       if (msgRes.ok) {
         let msgData: {
           body?: { content?: string; contentType?: string };
-          attachments?: GraphAttachment[];
+          attachments?: MSTeamsAttachmentLike[];
         };
         try {
           msgData = await readProviderJsonResponse<typeof msgData>(
@@ -318,10 +312,10 @@ export async function downloadMSTeamsGraphMedia(params: {
         } catch (err) {
           params.logger?.debug?.("graph media message parse failed", {
             messageUrl,
-            error: err instanceof Error ? err.message : String(err),
+            error: coerceErrorMessage(err),
           });
           params.logger?.warn?.("msteams graph message parse failed", {
-            error: err instanceof Error ? err.message : String(err),
+            error: coerceErrorMessage(err),
             messageUrl,
           });
           msgData = {};
@@ -338,15 +332,15 @@ export async function downloadMSTeamsGraphMedia(params: {
         });
       }
     } finally {
-      await release();
+      await releaseGraphResponse(msgRes, release);
     }
   } catch (err) {
     params.logger?.debug?.("graph media message fetch failed", {
       messageUrl,
-      error: err instanceof Error ? err.message : String(err),
+      error: coerceErrorMessage(err),
     });
     params.logger?.warn?.("msteams graph message fetch failed", {
-      error: err instanceof Error ? err.message : String(err),
+      error: coerceErrorMessage(err),
     });
   }
 
@@ -388,8 +382,6 @@ export async function downloadMSTeamsGraphMedia(params: {
         maxBytes: params.maxBytes,
         contentTypeHint: "application/octet-stream",
         preserveFilenames: params.preserveFilenames,
-        ssrfPolicy,
-        useDirectFetch: true,
         fetchImpl: async (input, init) => {
           const requestUrl = resolveRequestUrl(input);
           const headers = ensureUserAgentHeader(init?.headers);
@@ -417,7 +409,7 @@ export async function downloadMSTeamsGraphMedia(params: {
     } catch (err) {
       sharePointMedia.push(unavailableMedia);
       params.logger?.warn?.("msteams SharePoint reference download failed", {
-        error: err instanceof Error ? err.message : String(err),
+        error: coerceErrorMessage(err),
         name,
       });
     }
@@ -428,7 +420,6 @@ export async function downloadMSTeamsGraphMedia(params: {
     messageUrl,
     maxBytes: params.maxBytes,
     fetchFn: params.fetchFn,
-    preserveFilenames: params.preserveFilenames,
     ssrfPolicy,
     logger: params.logger,
     deadline: params.deadline,
@@ -466,7 +457,7 @@ export async function downloadMSTeamsGraphMedia(params: {
     });
   } catch (err) {
     params.logger?.warn?.("msteams graph attachment download failed", {
-      error: err instanceof Error ? err.message : String(err),
+      error: coerceErrorMessage(err),
       messageUrl,
     });
   }

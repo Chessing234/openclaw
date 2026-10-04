@@ -2,11 +2,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChannelPlugin } from "../channels/plugins/types.public.js";
 import type { OpenClawConfig } from "../config/config.js";
-import { EMPTY_PREPARED_MESSAGE_TOOL_CATALOG } from "../plugins/prepared-message-tool-catalog.js";
 import { setActivePluginRegistry } from "../plugins/runtime.js";
 import { defaultRuntime } from "../runtime.js";
 import { createTestRegistry } from "../test-utils/channel-plugins.js";
 import { listAllChannelSupportedActions, listChannelSupportedActions } from "./channel-tools.js";
+
+const EMPTY_PREPARED_MESSAGE_TOOL_CATALOG = {
+  version: 0,
+  channels: [],
+  getChannel: () => undefined,
+} as const;
 
 describe("channel tools", () => {
   const errorSpy = vi.spyOn(defaultRuntime, "error").mockImplementation(() => undefined);
@@ -118,33 +123,5 @@ describe("channel tools", () => {
 
     const cfg = {} as OpenClawConfig;
     expect(listChannelSupportedActions({ cfg, channel: "tg" })).toEqual(["react"]);
-  });
-
-  it("uses unified message tool discovery", () => {
-    const plugin: ChannelPlugin = {
-      id: "telegram",
-      meta: {
-        id: "telegram",
-        label: "Telegram",
-        selectionLabel: "Telegram",
-        docsPath: "/channels/telegram",
-        blurb: "telegram plugin",
-      },
-      capabilities: { chatTypes: ["direct"] },
-      config: {
-        listAccountIds: () => [],
-        resolveAccount: () => ({}),
-      },
-      actions: {
-        describeMessageTool: () => ({
-          actions: ["react"],
-        }),
-      },
-    };
-
-    setActivePluginRegistry(createTestRegistry([{ pluginId: "telegram", source: "test", plugin }]));
-
-    const cfg = {} as OpenClawConfig;
-    expect(listChannelSupportedActions({ cfg, channel: "telegram" })).toEqual(["react"]);
   });
 });

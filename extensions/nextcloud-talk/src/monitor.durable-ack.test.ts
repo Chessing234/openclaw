@@ -1,4 +1,5 @@
 // Nextcloud Talk webhook acknowledgement follows durable admission.
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { describe, expect, it, vi } from "vitest";
 import { createSignedCreateMessageRequest } from "./monitor.test-fixtures.js";
 import { startWebhookServer } from "./monitor.test-harness.js";
@@ -10,7 +11,9 @@ describe("Nextcloud Talk durable webhook acknowledgement", () => {
     const admission = new Promise<void>((resolve) => {
       releaseAdmission = resolve;
     });
+    const entered = createDeferred<void>();
     const onWebhook = vi.fn(async () => {
+      entered.resolve();
       await admission;
       return "accepted" as const;
     });
@@ -21,10 +24,12 @@ describe("Nextcloud Talk durable webhook acknowledgement", () => {
       settled = true;
     });
 
-    await vi.waitFor(() => expect(onWebhook).toHaveBeenCalledTimes(1));
+    await entered.promise;
     expect(settled).toBe(false);
     releaseAdmission();
-    expect((await request).status).toBe(200);
+    const response = await request;
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-openclaw-delivery-accepted")).toBe("durable");
   });
 
   it("does not acknowledge a failed durable append", async () => {
@@ -37,6 +42,18 @@ describe("Nextcloud Talk durable webhook acknowledgement", () => {
     const { body, headers } = createSignedCreateMessageRequest();
     const response = await fetch(harness.webhookUrl, { method: "POST", headers, body });
     expect(response.status).toBe(500);
+    expect(response.headers.get("x-openclaw-delivery-accepted")).toBeNull();
+  });
+
+  it("does not mark ignored webhook events as durable", async () => {
+    const harness = await startWebhookServer({
+      path: "/nextcloud-ignored-event",
+      onWebhook: vi.fn(async () => "ignored" as const),
+    });
+    const { body, headers } = createSignedCreateMessageRequest();
+    const response = await fetch(harness.webhookUrl, { method: "POST", headers, body });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-openclaw-delivery-accepted")).toBeNull();
   });
 
   it("maps permanent pre-admission payload failures to 400", async () => {
@@ -49,6 +66,7 @@ describe("Nextcloud Talk durable webhook acknowledgement", () => {
     const { body, headers } = createSignedCreateMessageRequest();
     const response = await fetch(harness.webhookUrl, { method: "POST", headers, body });
     expect(response.status).toBe(400);
+    expect(response.headers.get("x-openclaw-delivery-accepted")).toBeNull();
     expect(await response.json()).toEqual({ error: "Invalid payload format" });
   });
 });

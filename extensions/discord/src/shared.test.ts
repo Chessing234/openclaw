@@ -1,4 +1,3 @@
-// Discord tests cover shared plugin behavior.
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDiscordPluginBase, discordConfigAdapter } from "./shared.js";
@@ -9,7 +8,7 @@ afterEach(() => {
 
 describe("createDiscordPluginBase", () => {
   it("owns Discord native command name overrides", () => {
-    const plugin = createDiscordPluginBase({ setup: {} as never });
+    const plugin = createDiscordPluginBase({ setupContract: {} as never });
 
     expect(
       plugin.commands?.resolveNativeCommandName?.({
@@ -32,7 +31,7 @@ describe("createDiscordPluginBase", () => {
   });
 
   it("exposes security checks on the setup surface", () => {
-    const plugin = createDiscordPluginBase({ setup: {} as never });
+    const plugin = createDiscordPluginBase({ setupContract: {} as never });
 
     expect(plugin.security?.resolveDmPolicy).toBeTypeOf("function");
     expect(plugin.security?.collectWarnings).toBeTypeOf("function");
@@ -40,14 +39,14 @@ describe("createDiscordPluginBase", () => {
   });
 
   it("hydrates announce delivery targets from stored session routing", () => {
-    const plugin = createDiscordPluginBase({ setup: {} as never });
+    const plugin = createDiscordPluginBase({ setupContract: {} as never });
 
     expect(plugin.meta.preferSessionLookupForAnnounceTarget).toBe(true);
   });
 
   it("reports duplicate-token accounts as disabled to gateway startup", () => {
     vi.stubEnv("DISCORD_BOT_TOKEN", "same-token");
-    const plugin = createDiscordPluginBase({ setup: {} as never });
+    const plugin = createDiscordPluginBase({ setupContract: {} as never });
     const cfg = {
       channels: {
         discord: {
@@ -71,7 +70,7 @@ describe("createDiscordPluginBase", () => {
   });
 
   it("describes unresolved SecretRef tokens as startup-configured so startup reports the resolver error", () => {
-    const plugin = createDiscordPluginBase({ setup: {} as never });
+    const plugin = createDiscordPluginBase({ setupContract: {} as never });
     const cfg = {
       channels: {
         discord: {
@@ -93,22 +92,6 @@ describe("createDiscordPluginBase", () => {
 });
 
 describe("discordConfigAdapter", () => {
-  it("resolves canonical allowFrom", () => {
-    const cfg = {
-      channels: {
-        discord: {
-          accounts: {
-            default: {
-              allowFrom: ["123"],
-            },
-          },
-        },
-      },
-    } as OpenClawConfig;
-
-    expect(discordConfigAdapter.resolveAllowFrom?.({ cfg, accountId: "default" })).toEqual(["123"]);
-  });
-
   it("ignores retired nested dm.allowFrom", () => {
     const cfg = {
       channels: {

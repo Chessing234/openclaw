@@ -1,10 +1,15 @@
-// Tlon plugin module implements sse client behavior.
 import { randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import { resolveTimerTimeoutMs } from "openclaw/plugin-sdk/number-runtime";
 import { readResponseTextLimited } from "openclaw/plugin-sdk/provider-http";
+import { sleepWithAbort } from "openclaw/plugin-sdk/runtime-env";
 import type { LookupFn, SsrFPolicy } from "openclaw/plugin-sdk/ssrf-runtime";
-import { ensureUrbitChannelOpen, pokeUrbitChannel, scryUrbitPath } from "./channel-ops.js";
+import {
+  ensureUrbitChannelOpen,
+  pokeUrbitChannel,
+  putUrbitChannel,
+  scryUrbitPath,
+} from "./channel-ops.js";
 import { getUrbitContext, normalizeUrbitCookie } from "./context.js";
 import { UrbitHttpError } from "./errors.js";
 import { urbitFetch } from "./fetch.js";
@@ -54,7 +59,6 @@ export class UrbitSSEClient {
   cookie: string;
   ship: string;
   channelId: string;
-  channelUrl: string;
   subscriptions: Array<{
     id: number;
     action: "subscribe";
@@ -89,6 +93,9 @@ export class UrbitSSEClient {
   private lastHeardEventId = -1;
   private lastAcknowledgedEventId = -1;
   private readonly ackThreshold = 20;
+  // The monitor stops ingress before it closes the channel; cancel both retry
+  // delays at that first shutdown edge so stale work cannot outlive its owner.
+  private readonly reconnectAbortController = new AbortController();
 
   constructor(url: string, cookie: string, options: UrbitSseOptions = {}) {
     const ctx = getUrbitContext(url, options.ship);
@@ -96,7 +103,6 @@ export class UrbitSSEClient {
     this.cookie = normalizeUrbitCookie(cookie);
     this.ship = ctx.ship;
     this.channelId = `${Math.floor(Date.now() / 1000)}-${randomUUID()}`;
-    this.channelUrl = new URL(`/~/channel/${this.channelId}`, this.url).toString();
     this.onReconnect = options.onReconnect ?? null;
     this.autoReconnect = options.autoReconnect !== false;
     this.maxReconnectAttempts = options.maxReconnectAttempts ?? 10;
@@ -122,7 +128,6 @@ export class UrbitSSEClient {
 
   private resetChannelIdentity(): void {
     this.channelId = `${Math.floor(Date.now() / 1000)}-${randomUUID()}`;
-    this.channelUrl = new URL(`/~/channel/${this.channelId}`, this.url).toString();
     this.lastHeardEventId = -1;
     this.lastAcknowledgedEventId = -1;
   }
@@ -164,14 +169,9 @@ export class UrbitSSEClient {
     return subId;
   }
 
-  private async sendSubscription(subscription: {
-    id: number;
-    action: "subscribe";
-    ship: string;
-    app: string;
-    path: string;
-  }) {
-    const { response, release } = await this.putChannelPayload([subscription], {
+  private async sendSubscription(subscription: UrbitSSEClient["subscriptions"][number]) {
+    const { response, release } = await putUrbitChannel(this.channelRequestContext(), {
+      body: [subscription],
       timeoutMs: 30_000,
       auditContext: "tlon-urbit-subscribe",
     });
@@ -347,11 +347,12 @@ export class UrbitSSEClient {
     let eventId: number | null = null;
 
     for (const line of lines) {
-      if (line.startsWith("id: ")) {
-        eventId = parseUrbitSseEventId(line.slice(4));
+      // SSE permits both `field:value` and `field: value`; parse them identically.
+      if (line.startsWith("id:")) {
+        eventId = parseUrbitSseEventId(line.slice("id:".length).trim());
       }
-      if (line.startsWith("data: ")) {
-        data = line.slice(6);
+      if (line.startsWith("data:")) {
+        data = line.slice("data:".length).trim();
       }
     }
 
@@ -417,22 +418,12 @@ export class UrbitSSEClient {
   }
 
   async scry(path: string) {
-    return await scryUrbitPath(
-      {
-        baseUrl: this.url,
-        cookie: this.cookie,
-        ssrfPolicy: this.ssrfPolicy,
-        lookupFn: this.lookupFn,
-        fetchImpl: this.fetchImpl,
-      },
-      { path, auditContext: "tlon-urbit-scry" },
-    );
+    return await scryUrbitPath(this.channelRequestContext(), {
+      path,
+      auditContext: "tlon-urbit-scry",
+    });
   }
 
-  /**
-   * Update the cookie used for authentication.
-   * Call this when re-authenticating after session expiry.
-   */
   updateCookie(newCookie: string): void {
     this.cookie = normalizeUrbitCookie(newCookie);
   }
@@ -444,7 +435,8 @@ export class UrbitSSEClient {
       "event-id": eventId,
     };
 
-    const { response, release } = await this.putChannelPayload([ackData], {
+    const { response, release } = await putUrbitChannel(this.channelRequestContext(), {
+      body: [ackData],
       timeoutMs: 10_000,
       auditContext: "tlon-urbit-ack",
     });
@@ -465,17 +457,14 @@ export class UrbitSSEClient {
       return;
     }
 
-    // If we've hit max attempts, wait longer then reset and keep trying
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       this.logger.log?.(
         `[SSE] Max reconnection attempts (${this.maxReconnectAttempts}) reached. Waiting 10s before resetting...`,
       );
-      // Wait 10 seconds before resetting and trying again
-      const extendedBackoff = 10000; // 10 seconds
-      await new Promise((resolve) => {
-        setTimeout(resolve, extendedBackoff);
-      });
-      this.reconnectAttempts = 0; // Reset counter to continue trying
+      if (!(await this.waitForReconnectDelay(10_000)) || this.aborted) {
+        return;
+      }
+      this.reconnectAttempts = 0;
       this.logger.log?.("[SSE] Reconnection attempts reset, resuming reconnection...");
     }
 
@@ -489,11 +478,7 @@ export class UrbitSSEClient {
       `[SSE] Reconnection attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts} in ${delay}ms...`,
     );
 
-    await new Promise((resolve) => {
-      setTimeout(resolve, delay);
-    });
-
-    if (this.aborted || !this.autoReconnect) {
+    if (!(await this.waitForReconnectDelay(delay)) || this.aborted || !this.autoReconnect) {
       return;
     }
 
@@ -528,6 +513,7 @@ export class UrbitSSEClient {
   stopReceiving(): void {
     this.aborted = true;
     this.isConnected = false;
+    this.reconnectAbortController.abort();
     this.streamController?.abort();
   }
 
@@ -542,19 +528,16 @@ export class UrbitSSEClient {
       }));
 
       {
-        const { response, release } = await this.putChannelPayload(unsubscribes, {
+        const { release } = await putUrbitChannel(this.channelRequestContext(), {
+          body: unsubscribes,
           timeoutMs: 30_000,
           auditContext: "tlon-urbit-unsubscribe",
         });
-        try {
-          void response.body?.cancel().catch(() => undefined);
-        } finally {
-          await release();
-        }
+        await release();
       }
 
       {
-        const { response, release } = await urbitFetch({
+        const { release } = await urbitFetch({
           baseUrl: this.url,
           path: `/~/channel/${this.channelId}`,
           init: {
@@ -569,11 +552,7 @@ export class UrbitSSEClient {
           timeoutMs: 30_000,
           auditContext: "tlon-urbit-channel-close",
         });
-        try {
-          void response.body?.cancel().catch(() => undefined);
-        } finally {
-          await release();
-        }
+        await release();
       }
     } catch (error) {
       this.logger.error?.(`Error closing channel: ${String(error)}`);
@@ -586,26 +565,15 @@ export class UrbitSSEClient {
     }
   }
 
-  private async putChannelPayload(
-    payload: unknown,
-    params: { timeoutMs: number; auditContext: string },
-  ) {
-    return await urbitFetch({
-      baseUrl: this.url,
-      path: `/~/channel/${this.channelId}`,
-      init: {
-        method: "PUT",
-        headers: {
-          "Content-Type": "application/json",
-          Cookie: this.cookie,
-        },
-        body: JSON.stringify(payload),
-      },
-      ssrfPolicy: this.ssrfPolicy,
-      lookupFn: this.lookupFn,
-      fetchImpl: this.fetchImpl,
-      timeoutMs: params.timeoutMs,
-      auditContext: params.auditContext,
-    });
+  private async waitForReconnectDelay(delayMs: number): Promise<boolean> {
+    try {
+      await sleepWithAbort(delayMs, this.reconnectAbortController.signal);
+      return true;
+    } catch (error) {
+      if (this.reconnectAbortController.signal.aborted) {
+        return false;
+      }
+      throw error;
+    }
   }
 }

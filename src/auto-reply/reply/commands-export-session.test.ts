@@ -1,6 +1,7 @@
 // Tests session and trajectory export command packaging, filesystem writes, and approval routing.
 import { expectDefined } from "@openclaw/normalization-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { generateExportHtmlVendorAssets } from "../../../scripts/runtime-postbuild.mts";
 import { FsSafeError } from "../../infra/fs-safe.js";
 import { buildExportSessionReply } from "./commands-export-session.js";
 import type { HandleCommandsParams } from "./commands-types.js";
@@ -39,14 +40,15 @@ const hoisted = await vi.hoisted(async () => {
     sessionTranscriptEvents: [] as unknown[],
   };
 });
+const generatedVendorAssets = generateExportHtmlVendorAssets();
 
-vi.mock("../../acp/runtime/session-meta.js", () => ({
+vi.mock("../../acp/runtime/session-meta-readonly.js", () => ({
   readAcpSessionMetaForEntry: hoisted.readAcpSessionMetaForEntryMock,
 }));
 
 vi.mock("../../config/sessions/paths.js", () => ({
   resolveDefaultSessionStorePath: hoisted.resolveDefaultSessionStorePathMock,
-  resolveSessionFilePath: hoisted.resolveSessionFilePathMock,
+  resolveSessionFilePathCore: hoisted.resolveSessionFilePathMock,
   resolveSessionFilePathOptions: hoisted.resolveSessionFilePathOptionsMock,
 }));
 
@@ -108,7 +110,7 @@ vi.mock("node:fs/promises", async () => {
           return contents;
         }
       }
-      return actual.readFile(filePath, encoding);
+      return actual.readFile(filePath, { encoding });
     }),
   };
   return {
@@ -138,6 +140,7 @@ function makeParams(): HandleCommandsParams {
       updatedAt: 1,
     },
     sessionKey: "agent:target:session",
+    agentId: "target",
     workspaceDir: "/tmp/workspace",
     directives: {},
     elevated: { enabled: true, allowed: true, failures: [] },
@@ -180,6 +183,17 @@ function sessionDataFromHtml(html: string): Record<string, unknown> {
   );
 }
 
+function userTranscript() {
+  return [
+    {
+      type: "message",
+      id: "entry-1",
+      timestamp: "2026-05-16T00:00:00.000Z",
+      message: { role: "user", content: "hello" },
+    },
+  ];
+}
+
 describe("buildExportSessionReply", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -211,6 +225,9 @@ describe("buildExportSessionReply", () => {
       async () => hoisted.sessionTranscriptEvents,
     );
     hoisted.exportHtmlTemplateContents.clear();
+    for (const [fileName, contents] of Object.entries(generatedVendorAssets)) {
+      hoisted.exportHtmlTemplateContents.set(`vendor/${fileName}`, contents);
+    }
     hoisted.sessionTranscriptEvents = [];
   });
 
@@ -272,6 +289,21 @@ describe("buildExportSessionReply", () => {
   });
 
   it("injects scripts and session data through the real export template", async () => {
+    const entries = [
+      {
+        type: "message",
+        id: "hidden-input",
+        parentId: null,
+        timestamp: "2026-08-31T12:00:00.000Z",
+        message: {
+          role: "user",
+          content: "Synthetic continuation input",
+          display: false,
+          provenance: { kind: "internal_system", sourceTool: "openclaw_agent_consult" },
+        },
+      },
+    ];
+    hoisted.sessionTranscriptEvents = entries;
     await buildExportSessionReply(makeParams());
 
     const html = writtenHtml();
@@ -285,8 +317,8 @@ describe("buildExportSessionReply", () => {
       Buffer.from(
         JSON.stringify({
           header: null,
-          entries: [],
-          leafId: null,
+          entries,
+          leafId: "hidden-input",
           hasLeafControl: false,
           systemPrompt: "system prompt",
           tools: [],
@@ -610,6 +642,30 @@ describe("buildExportSessionReply", () => {
     );
   });
 
+  it("marks the skipped-row list as truncated when more than 20 rows are invalid", async () => {
+    hoisted.sessionTranscriptEvents = [
+      ...Array.from({ length: 25 }, (_, index) => ({
+        type: "message",
+        id: `bad-${index + 1}`,
+        timestamp: `2026-05-16T00:00:${String(index).padStart(2, "0")}.000Z`,
+        message: { content: "missing role" },
+      })),
+      {
+        type: "message",
+        id: "entry-valid",
+        timestamp: "2026-05-16T00:01:00.000Z",
+        message: { role: "assistant", content: "valid assistant" },
+      },
+    ];
+
+    const reply = await buildExportSessionReply(makeParams());
+
+    const expectedRows = Array.from({ length: 20 }, (_, index) => index + 1).join(", ");
+    expect(reply.text).toContain(
+      `⚠️ Skipped 25 malformed transcript rows that were not session entries. rows ${expectedRows}, …`,
+    );
+  });
+
   it("warns when the session only contains user messages (backend-delegated transcript)", async () => {
     hoisted.loadSessionStoreMock.mockReturnValue({
       "agent:target:session": {
@@ -653,14 +709,7 @@ describe("buildExportSessionReply", () => {
       state: "idle",
       lastActivityAt: 1,
     });
-    hoisted.sessionTranscriptEvents = [
-      {
-        type: "message",
-        id: "entry-1",
-        timestamp: "2026-05-16T00:00:00.000Z",
-        message: { role: "user", content: "hello" },
-      },
-    ];
+    hoisted.sessionTranscriptEvents = userTranscript();
 
     const reply = await buildExportSessionReply(makeParams());
 
@@ -679,14 +728,7 @@ describe("buildExportSessionReply", () => {
     hoisted.readAcpSessionMetaForEntryMock.mockImplementation(() => {
       throw new Error("state database unavailable");
     });
-    hoisted.sessionTranscriptEvents = [
-      {
-        type: "message",
-        id: "entry-1",
-        timestamp: "2026-05-16T00:00:00.000Z",
-        message: { role: "user", content: "hello" },
-      },
-    ];
+    hoisted.sessionTranscriptEvents = userTranscript();
 
     const reply = await buildExportSessionReply(makeParams());
 
@@ -696,14 +738,7 @@ describe("buildExportSessionReply", () => {
   });
 
   it("does not warn for a normal user-only transcript without backend session metadata", async () => {
-    hoisted.sessionTranscriptEvents = [
-      {
-        type: "message",
-        id: "entry-1",
-        timestamp: "2026-05-16T00:00:00.000Z",
-        message: { role: "user", content: "hello" },
-      },
-    ];
+    hoisted.sessionTranscriptEvents = userTranscript();
 
     const reply = await buildExportSessionReply(makeParams());
 
@@ -725,14 +760,7 @@ describe("buildExportSessionReply", () => {
         },
       },
     } as never);
-    hoisted.sessionTranscriptEvents = [
-      {
-        type: "message",
-        id: "entry-1",
-        timestamp: "2026-05-16T00:00:00.000Z",
-        message: { role: "user", content: "hello" },
-      },
-    ];
+    hoisted.sessionTranscriptEvents = userTranscript();
 
     const reply = await buildExportSessionReply(makeParams());
 

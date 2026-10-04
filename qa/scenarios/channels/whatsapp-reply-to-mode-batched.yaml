@@ -11,8 +11,10 @@ scenario:
     timeoutMs: 90000
     retryCount: 1
     suiteIsolation: isolated
-    config: { whatsappScenarioId: whatsapp-reply-to-mode-batched }
+    config:
+      whatsappScenario: whatsappQaReplyToModeBatchedScenario
 flow:
   module: ./live-transports/whatsapp/scenario-runtime.js
-  call: runWhatsAppReplyToModeBatchedScenario
-  args: [{ expr: whatsappScenarioContext }]
+  call: runWhatsAppScenario
+  args:
+    - { expr: whatsappScenarioContext }

@@ -233,11 +233,13 @@ async function resolveAllowedChannelTarget(
     allowNameMatching: isDangerousNameMatchingEnabled(teams),
   });
   const stableTarget = await resolveStableChannelTarget(cfg, target);
+  if (!directRoute.allowlistConfigured && groupPolicy !== "open" && stableTarget) {
+    throw new ToolAuthorizationError(
+      'Microsoft Teams read target is not allowed. Configure channels.msteams.teams.<team>.channels for this channel, or deliberately set channels.msteams.groupPolicy to "open".',
+    );
+  }
   if (directRoute.allowed) {
     return stableTarget;
-  }
-  if (!directRoute.allowlistConfigured) {
-    return groupPolicy === "open" ? stableTarget : undefined;
   }
   if (!stableTarget || !teams?.teams) {
     return undefined;
@@ -294,39 +296,29 @@ export async function assertMSTeamsReadTargetAllowed(params: {
   const current = isCurrentMSTeamsReadTarget({ ctx: params.ctx, target });
   const directOperator = params.ctx.conversationReadOrigin === "direct-operator";
   const currentChatType = params.ctx.toolContext?.currentChatType;
+  const groupEnabled = resolveMSTeamsReadGroupPolicy(params.cfg) !== "disabled";
+  const dmEnabled = params.cfg.channels?.msteams?.dmPolicy !== "disabled";
+  const currentScopeEnabled = isChannel
+    ? groupEnabled
+    : isDm || currentChatType === "direct"
+      ? dmEnabled
+      : currentChatType === "group" || currentChatType === "channel"
+        ? groupEnabled
+        : groupEnabled && dmEnabled;
   const allowedTarget = directOperator
     ? isChannel
-      ? resolveMSTeamsReadGroupPolicy(params.cfg) !== "disabled"
+      ? groupEnabled
         ? await resolveStableChannelTarget(params.cfg, target)
         : undefined
       : isDm
         ? await resolveDirectDmTarget(params.cfg, target)
-        : isChat &&
-            resolveMSTeamsReadGroupPolicy(params.cfg) !== "disabled" &&
-            params.cfg.channels?.msteams?.dmPolicy !== "disabled"
+        : isChat && groupEnabled && dmEnabled
           ? target
           : undefined
     : current
-      ? isChannel
-        ? resolveMSTeamsReadGroupPolicy(params.cfg) !== "disabled"
-          ? target
-          : undefined
-        : isDm
-          ? params.cfg.channels?.msteams?.dmPolicy !== "disabled"
-            ? target
-            : undefined
-          : currentChatType === "direct"
-            ? params.cfg.channels?.msteams?.dmPolicy !== "disabled"
-              ? target
-              : undefined
-            : currentChatType === "group" || currentChatType === "channel"
-              ? resolveMSTeamsReadGroupPolicy(params.cfg) !== "disabled"
-                ? target
-                : undefined
-              : resolveMSTeamsReadGroupPolicy(params.cfg) !== "disabled" &&
-                  params.cfg.channels?.msteams?.dmPolicy !== "disabled"
-                ? target
-                : undefined
+      ? currentScopeEnabled
+        ? target
+        : undefined
       : isChannel
         ? await resolveAllowedChannelTarget(params.cfg, target)
         : isDm

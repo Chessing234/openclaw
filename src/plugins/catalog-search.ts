@@ -1,9 +1,8 @@
-// ClawHub-backed discovery for installable plugin package families.
 import {
   searchClawHubPackages,
   type ClawHubPackageFamily,
   type ClawHubPackageSearchResult,
-} from "../infra/clawhub.js";
+} from "../infra/clawhub-packages.js";
 
 const INSTALLABLE_PLUGIN_FAMILIES: readonly ClawHubPackageFamily[] = [
   "code-plugin",

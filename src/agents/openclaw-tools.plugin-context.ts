@@ -8,8 +8,12 @@ import {
  * Normalizes workspace, delivery, browser, sandbox, and active-model inputs before plugin tool invocation.
  */
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { normalizeDeliveryContext } from "../utils/delivery-context.js";
-import type { GatewayMessageChannel } from "../utils/message-channel.js";
+import {
+  assertMemoryAudienceCurrent,
+  assertMemoryAudienceSession,
+} from "../plugins/memory-audience.js";
+import type { MemoryAudience } from "../plugins/memory-provider-types.js";
+import { normalizeDeliveryContext } from "../utils/delivery-context.shared.js";
 import { resolveAgentWorkspaceDir, resolveSessionAgentIds } from "./agent-scope.js";
 import type { ConversationRecallContext } from "./conversation-recall.types.js";
 import { modelKey } from "./model-ref-shared.js";
@@ -19,7 +23,12 @@ import { resolveWorkspaceRoot } from "./workspace-dir.js";
 /** Options provided by agent runtime callers when invoking OpenClaw plugin tools. */
 export type OpenClawPluginToolOptions = {
   agentSessionKey?: string;
-  agentChannel?: GatewayMessageChannel;
+  runSessionKey?: string;
+  runId?: string;
+  /** Host-bound standalone request/grant authority, never supplied by tool arguments. */
+  assertInvocationCurrent?: () => void;
+  assertInputCommitAllowed?: () => void;
+  agentChannel?: string;
   agentAccountId?: string;
   agentTo?: string;
   /** Routable target for the current conversation when it differs from the native channel ID. */
@@ -28,6 +37,8 @@ export type OpenClawPluginToolOptions = {
   currentChannelId?: string;
   agentThreadId?: string | number;
   nativeChannelId?: string;
+  /** Opaque host-issued capability for current-turn channel message actions. */
+  messageActionTurnCapability?: string;
   agentDir?: string;
   workspaceDir?: string;
   config?: OpenClawConfig;
@@ -36,6 +47,10 @@ export type OpenClawPluginToolOptions = {
   modelId?: string;
   requesterSenderId?: string | null;
   senderIsOwner?: boolean;
+  /** Host-prepared memory audience shared by every plugin tool in this turn. */
+  memoryAudience?: MemoryAudience;
+  /** Stable identity for the active provider-owned memory flush. */
+  memoryFlush?: { flushId: string };
   conversationReadOrigin?: ConversationReadInvocationOrigin;
   requesterAgentIdOverride?: string;
   sessionId?: string;
@@ -61,8 +76,12 @@ export function resolveOpenClawPluginToolInputs(params: {
   getRuntimeConfig?: () => OpenClawConfig | undefined;
 }) {
   const { options, resolvedConfig, runtimeConfig, getRuntimeConfig } = params;
+  const sessionKey = options?.runSessionKey ?? options?.agentSessionKey;
+  if (options?.memoryAudience) {
+    assertMemoryAudienceSession(options.memoryAudience, sessionKey);
+  }
   const { sessionAgentId } = resolveSessionAgentIds({
-    sessionKey: options?.agentSessionKey,
+    sessionKey,
     config: resolvedConfig,
     agentId: options?.requesterAgentIdOverride,
   });
@@ -95,11 +114,12 @@ export function resolveOpenClawPluginToolInputs(params: {
       config: options?.config,
       runtimeConfig,
       getRuntimeConfig,
+      assertInputCommitAllowed: options?.assertInputCommitAllowed,
       fsPolicy: options?.fsPolicy,
       workspaceDir,
       agentDir: options?.agentDir,
       agentId: sessionAgentId,
-      sessionKey: options?.agentSessionKey,
+      sessionKey,
       sessionId: options?.sessionId,
       toolBindings: options?.toolBindings,
       activeProjectKeys: options?.activeProjectKeys,
@@ -115,6 +135,11 @@ export function resolveOpenClawPluginToolInputs(params: {
       nativeChannelId: options?.nativeChannelId,
       requesterSenderId: options?.requesterSenderId ?? undefined,
       senderIsOwner: options?.senderIsOwner,
+      memoryAudience: options?.memoryAudience,
+      memoryFlush: options?.memoryFlush,
+      assertMemoryAudienceCurrent: options?.memoryAudience
+        ? () => assertMemoryAudienceCurrent(options.memoryAudience!)
+        : undefined,
       conversationReadOrigin: normalizeConversationReadInvocationOrigin(
         options?.conversationReadOrigin,
       ),

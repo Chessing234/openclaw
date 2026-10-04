@@ -70,7 +70,7 @@ internal class WearProxyException(
   override val message: String,
 ) : IllegalStateException(message)
 
-internal class WearProxyClient private constructor(
+internal class WearProxyClient(
   private val nodeResolver: WearNodeResolver,
   private val transport: WearMessageTransport,
 ) : WearRpcRequester {
@@ -98,7 +98,7 @@ internal class WearProxyClient private constructor(
   ): WearRpcResult {
     var attemptedPreferredPhone: PreferredPhoneRegistration? = null
     val result =
-      withTimeoutOrNull(REQUEST_TIMEOUT_MS) {
+      withTimeoutOrNull(WearProtocol.RPC_REQUEST_TIMEOUT_MILLIS) {
         requestBeforeDeadline(method, params, expectedNodeId, requirePreferredNode) { registration ->
           attemptedPreferredPhone = registration
         }
@@ -149,11 +149,8 @@ internal class WearProxyClient private constructor(
               WearMessage.Request(requestId = requestId, method = method, params = params),
             ),
         )
-      } catch (_: CancellationException) {
-        currentCoroutineContext().ensureActive()
-        invalidatePreferredPhone(preferredPhone?.takeIf { it.nodeId == nodeId })
-        throw WearProxyException("phone_unavailable", "Paired phone is unavailable")
-      } catch (_: Throwable) {
+      } catch (error: Throwable) {
+        if (error is CancellationException) currentCoroutineContext().ensureActive()
         invalidatePreferredPhone(preferredPhone?.takeIf { it.nodeId == nodeId })
         throw WearProxyException("phone_unavailable", "Paired phone is unavailable")
       }
@@ -200,6 +197,7 @@ internal class WearProxyClient private constructor(
             }
           null
         }
+
         path == WearProtocol.EVENT_PATH && message is WearMessage.Event -> {
           if (!acceptEventSource(sourceNodeId)) return@withLock null
           val inbound =
@@ -213,19 +211,20 @@ internal class WearProxyClient private constructor(
           mutableEvents.tryEmit(inbound)
           inbound
         }
-        else -> null
+
+        else -> {
+          null
+        }
       }
     }
 
   private suspend fun resolvePhoneNode(): String =
     try {
       nodeResolver.reachablePhoneNodeId()
-    } catch (_: CancellationException) {
+    } catch (error: Throwable) {
       // Play Services can cancel its Task while this request remains active.
       // Preserve actual caller cancellation; map transport cancellation below.
-      currentCoroutineContext().ensureActive()
-      throw WearProxyException("phone_unavailable", "Paired phone is unavailable")
-    } catch (_: Throwable) {
+      if (error is CancellationException) currentCoroutineContext().ensureActive()
       throw WearProxyException("phone_unavailable", "Paired phone is unavailable")
     } ?: throw WearProxyException("phone_unavailable", "Paired phone is unavailable")
 
@@ -337,7 +336,6 @@ internal class WearProxyClient private constructor(
   )
 
   companion object {
-    private const val REQUEST_TIMEOUT_MS = 10_000L
     private const val MAX_BUFFERED_EVENTS = 64
 
     fun create(context: Context): WearProxyClient {
@@ -350,22 +348,17 @@ internal class WearProxyClient private constructor(
             selectReachablePhoneNodeId(
               capabilityClient
                 .getCapability(WearProtocol.PHONE_CAPABILITY, CapabilityClient.FILTER_REACHABLE)
-                .await()
+                .awaitWearTask()
                 .nodes
                 .map { node -> WearReachablePhoneNode(id = node.id, isNearby = node.isNearby) },
             )
           },
         transport =
           WearMessageTransport { nodeId, path, data ->
-            messageClient.sendMessage(nodeId, path, data).await()
+            messageClient.sendMessage(nodeId, path, data).awaitWearTask()
           },
       )
     }
-
-    internal fun createForTests(
-      nodeResolver: WearNodeResolver,
-      transport: WearMessageTransport,
-    ): WearProxyClient = WearProxyClient(nodeResolver, transport)
   }
 }
 
@@ -398,6 +391,10 @@ internal data class WearResponseRequest(
   val eventGeneration: Long,
 )
 
+internal data class WearReadOnlyResponseRequest(
+  val eventGeneration: Long,
+)
+
 internal class WearEventSequenceTracker {
   private var streamId: String? = null
   private var lastSequence: Long? = null
@@ -418,7 +415,7 @@ internal class WearEventSequenceTracker {
       return
     }
     val previous = lastSequence
-    val streamChanged = this.streamId != streamId && (this.streamId != null || streamId != null)
+    val streamChanged = this.streamId != streamId
     this.streamId = streamId
     if (awaitingSnapshot || previous == null || streamChanged || sequence > previous) lastSequence = sequence
     awaitingSnapshot = false
@@ -437,12 +434,7 @@ internal class WearEventSequenceTracker {
       eventGeneration += 1
       return WearSequenceDecision.Accepted
     }
-    if (this.streamId != streamId && (this.streamId != null || streamId != null)) {
-      awaitingSnapshot = true
-      eventGeneration += 1
-      return WearSequenceDecision.GapOrReset
-    }
-    if (sequence == previous + 1) {
+    if (this.streamId == streamId && sequence == previous + 1) {
       lastSequence = sequence
       eventGeneration += 1
       return WearSequenceDecision.Accepted
@@ -462,6 +454,11 @@ internal class WearEventSequenceTracker {
     return WearResponseRequest(responseGeneration = responseGeneration, eventGeneration = eventGeneration)
   }
 
+  // Read-only projections may overlap a model request. Their owner supplies
+  // feature-local cancellation, while this token only binds the event cursor.
+  @Synchronized
+  fun beginReadOnlyResponseRequest(): WearReadOnlyResponseRequest = WearReadOnlyResponseRequest(eventGeneration = eventGeneration)
+
   @Synchronized
   fun invalidateResponseRequests() {
     responseGeneration += 1
@@ -474,11 +471,26 @@ internal class WearEventSequenceTracker {
     sequence: Long?,
   ): Boolean {
     if (request.responseGeneration != responseGeneration) return false
+    return isEventCursorCurrent(request.eventGeneration, streamId, sequence)
+  }
+
+  @Synchronized
+  fun isReadOnlyResponseCurrent(
+    request: WearReadOnlyResponseRequest,
+    streamId: String?,
+    sequence: Long?,
+  ): Boolean = isEventCursorCurrent(request.eventGeneration, streamId, sequence)
+
+  private fun isEventCursorCurrent(
+    requestEventGeneration: Long,
+    responseStreamId: String?,
+    sequence: Long?,
+  ): Boolean {
     if (awaitingSnapshot) return false
-    if (this.streamId != streamId && (this.streamId != null || streamId != null)) return false
+    if (this.streamId != responseStreamId) return false
     val currentSequence = lastSequence
     return if (sequence == null) {
-      request.eventGeneration == eventGeneration
+      requestEventGeneration == eventGeneration
     } else {
       sequence == currentSequence
     }
@@ -566,7 +578,7 @@ internal class WearEventResyncBuffer(
   }
 }
 
-private suspend fun <T> Task<T>.await(): T =
+internal suspend fun <T> Task<T>.awaitWearTask(): T =
   suspendCancellableCoroutine { continuation ->
     addOnSuccessListener { value -> if (continuation.isActive) continuation.resume(value) }
     addOnFailureListener { error -> if (continuation.isActive) continuation.resumeWithException(error) }

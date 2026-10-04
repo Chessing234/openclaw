@@ -1,3 +1,4 @@
+import type { AgentToolSurfacePresentation } from "../../packages/gateway-protocol/src/schema/worker-gateway-tool.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { getActiveAgentRingZeroTools } from "./agent-tools.ring-zero-context.js";
 import {
@@ -5,6 +6,7 @@ import {
   isCodeModeEngagedForModel,
   resolveCodeModeConfig,
 } from "./code-mode.js";
+import { normalizeToolPolicyName, readToolAllowlistIntersection } from "./tool-policy-shared.js";
 import { resolveAgentToolSearchRuntimeConfig } from "./tool-search-runtime-config.js";
 import type { ToolSearchConfig } from "./tool-search-types.js";
 import {
@@ -13,46 +15,88 @@ import {
   resolveToolSearchConfig,
 } from "./tool-search.js";
 
-type AgentToolSurfacePlanParams = {
+export type AgentToolSurfacePlanParams = {
   config?: OpenClawConfig;
   agentId?: string;
   sessionKey?: string;
   forceDirectMessageTool: boolean;
-  model?: { compat?: unknown };
+  model?: { compat?: unknown; toolSearchMode?: "tools" | false };
+  modelProvider?: string;
+  modelId?: string;
+  codeModeOverride?: boolean | "auto";
+  disableToolSearch?: true;
   toolsEnabled: boolean;
   disableTools?: boolean;
   isRawModelRun: boolean;
-  skillWorkshopProposalOnly?: boolean;
   toolsAllow?: readonly string[];
+  forceCodeModeControls?: boolean;
 };
 
 export function resolveAgentToolSurfacePlan(params: AgentToolSurfacePlanParams) {
-  const codeModeConfig = resolveCodeModeConfig(params.config, params.agentId);
-  const toolSearchRuntimeConfig = resolveAgentToolSearchRuntimeConfig({
+  const restrictions = params.toolsAllow
+    ? (readToolAllowlistIntersection(params.toolsAllow) ?? [params.toolsAllow])
+    : [];
+  // Private completion replies have one message capability. Ordinary forced
+  // delivery keeps message direct while other tools can still use discovery.
+  const completionPrivateMessageOnly =
+    params.forceDirectMessageTool &&
+    restrictions.some(
+      (allow) => allow.length === 1 && normalizeToolPolicyName(allow[0] ?? "") === "message",
+    );
+  const codeModeConfig = resolveCodeModeConfig(
+    params.config,
+    params.agentId,
+    params.modelProvider && params.modelId
+      ? { provider: params.modelProvider, modelId: params.modelId }
+      : undefined,
+  );
+  codeModeConfig.enabled = params.codeModeOverride ?? codeModeConfig.enabled;
+  const selectedToolConfig = resolveAgentToolSearchRuntimeConfig({
     config: params.config,
     agentId: params.agentId,
     sessionKey: params.sessionKey,
-    forceDirectMessageTool: params.forceDirectMessageTool,
+    completionPrivateMessageOnly,
+    model: params.model,
   });
+  // Apply invocation restrictions after selecting the current runtime snapshot;
+  // config rebinding must not put an auxiliary direct-tool run back behind discovery.
+  const toolSearchRuntimeConfig = params.disableToolSearch
+    ? { ...selectedToolConfig, tools: { ...selectedToolConfig?.tools, toolSearch: false as const } }
+    : selectedToolConfig;
   const toolSearchConfig = resolveToolSearchConfig(toolSearchRuntimeConfig);
   const toolsAvailable =
     params.toolsEnabled &&
     getActiveAgentRingZeroTools().length === 0 &&
     params.disableTools !== true &&
     !params.isRawModelRun &&
-    // Proposal-only workshop runs are deliberately narrow single-tool runs;
-    // code-mode indirection and tool-search catalogs are pure overhead.
-    params.skillWorkshopProposalOnly !== true &&
-    params.toolsAllow?.length !== 0;
+    restrictions.every((allow) => allow.length > 0) &&
+    !completionPrivateMessageOnly;
   const codeModeControlsEnabled =
-    toolsAvailable && isCodeModeEngagedForModel(codeModeConfig, params.model);
+    toolsAvailable &&
+    // Restart recovery continues one provider turn. Keep its original control
+    // schema even when the reloaded config disables Code Mode for new turns.
+    (params.forceCodeModeControls === true ||
+      isCodeModeEngagedForModel(codeModeConfig, params.model));
   const toolSearchControlsEnabled =
     toolsAvailable && !codeModeControlsEnabled && toolSearchConfig.enabled;
   return {
+    codeModeConfig,
     codeModeControlsEnabled,
     toolSearchControlsEnabled,
     toolSearchConfig,
     toolSearchRuntimeConfig,
+  };
+}
+
+/** Only resolved presentation facts cross a placement boundary; runtime config stays on its owner. */
+export function prepareAgentToolSurfacePresentation(
+  params: AgentToolSurfacePlanParams,
+): AgentToolSurfacePresentation {
+  const plan = resolveAgentToolSurfacePlan(params);
+  return {
+    codeMode: { ...plan.codeModeConfig, enabled: plan.codeModeControlsEnabled },
+    toolSearch: { ...plan.toolSearchConfig, enabled: plan.toolSearchControlsEnabled },
+    forceDirectMessageTool: params.forceDirectMessageTool,
   };
 }
 
@@ -77,16 +121,20 @@ export function applyAgentToolSurfaceCatalog({
   // When the message tool is the only reply path it must stay directly visible
   // in every search mode; a hidden delivery tool can leave the run mute.
   const directToolNames = forceDirectMessageTool ? ["message"] : [];
-  const applyCatalog = codeModeControlsEnabled
-    ? applyCodeModeCatalog
-    : toolSearchConfig.mode === "directory"
+  if (codeModeControlsEnabled) {
+    return applyCodeModeCatalog({
+      ...catalogParams,
+      config: catalogParams.config,
+      directToolNames,
+    });
+  }
+  const applyCatalog =
+    toolSearchConfig.mode === "directory"
       ? applyToolSchemaDirectoryCatalog
       : applyToolSearchCatalog;
   return applyCatalog({
     ...catalogParams,
-    // Code mode reads the base config; tool-search modes read the run's
-    // resolved tool-search runtime config.
-    config: codeModeControlsEnabled ? catalogParams.config : toolSearchRuntimeConfig,
+    config: toolSearchRuntimeConfig,
     directToolNames,
   });
 }

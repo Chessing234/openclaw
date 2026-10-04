@@ -7,8 +7,63 @@ import Testing
 
 @Suite("iOS managed media artifact loader")
 struct IOSMediaArtifactLoaderTests {
-    @Test @MainActor func `loads ticketed image with proxy headers and without a gateway bearer`() async throws {
-        let gatewayURL = try #require(URL(string: "wss://gateway.example"))
+    @Test(arguments: ["application/pdf", "text/csv", "application/zip", "text/html"])
+    @MainActor func `downloads documents using the pinned authenticated bounded route`(mimeType: String) async throws {
+        let tls = GatewayTLSParams(
+            required: true, expectedFingerprint: "sha256:fixture", allowTOFU: false, storeKey: "fixture")
+        let config = try Self.config(url: #require(URL(string: "wss://gateway.example/gw")), tls: tls)
+        let loader = IOSMediaArtifactLoader(
+            connectionProvider: {
+                IOSMediaArtifactLoader.Connection(
+                    config: config, gatewayID: config.effectiveStableID, customHeaders: ["X-Proxy-Token": "proxy"])
+            },
+            requestFactory: { receivedTLS, maximumBytes in
+                #expect(receivedTLS == tls)
+                #expect(maximumBytes == 100 * 1024 * 1024)
+                return { request in
+                    #expect(request.url?.absoluteString == "https://gateway.example/gw" + Self.ticketedPath)
+                    #expect(request.value(forHTTPHeaderField: "Accept") == "*/*")
+                    #expect(request.value(forHTTPHeaderField: "Authorization") == nil)
+                    #expect(request.value(forHTTPHeaderField: "X-Proxy-Token") == "proxy")
+                    return try Self.response(for: request, mimeType: mimeType, data: Data("fixture".utf8))
+                }
+            })
+        let loaded = try await loader.load(
+            response: Self.downloadResult(mimeType: mimeType), kind: .file,
+            expectedGatewayID: config.effectiveStableID)
+        guard case let .data(file) = loaded else {
+            Issue.record("Documents must be buffered for system file sharing, never streamed or rendered")
+            return
+        }
+        #expect(file.data == Data("fixture".utf8))
+        #expect(file.mimeType == mimeType)
+    }
+
+    @Test(arguments: [403, 404, 410])
+    @MainActor func `does not export denied missing or expired documents`(statusCode: Int) async throws {
+        let config = Self.config()
+        let loader = IOSMediaArtifactLoader(
+            connectionProvider: {
+                IOSMediaArtifactLoader.Connection(
+                    config: config, gatewayID: config.effectiveStableID, customHeaders: [:])
+            },
+            requestFactory: { _, _ in
+                { request in
+                    try Self.response(for: request, statusCode: statusCode, mimeType: "text/html", data: Data())
+                }
+            })
+        await #expect(throws: IOSMediaArtifactLoader.LoadError.requestFailed(statusCode: statusCode)) {
+            try await loader.load(
+                response: Self.downloadResult(mimeType: "application/pdf"), kind: .file,
+                expectedGatewayID: config.effectiveStableID)
+        }
+    }
+
+    @Test(arguments: Self.gatewayRoutes)
+    @MainActor func `loads ticketed image with proxy headers and without a gateway bearer`(
+        route: (gateway: String, media: String)) async throws
+    {
+        let gatewayURL = try #require(URL(string: route.gateway))
         let config = Self.config(url: gatewayURL)
         let loader = IOSMediaArtifactLoader(
             connectionProvider: {
@@ -20,7 +75,7 @@ struct IOSMediaArtifactLoaderTests {
             requestFactory: { _, maximumBytes in
                 #expect(maximumBytes == 12 * 1024 * 1024)
                 return { request in
-                    #expect(request.url?.absoluteString == Self.ticketedAbsoluteURL)
+                    #expect(request.url?.absoluteString == route.media + Self.ticketedPath)
                     #expect(request.value(forHTTPHeaderField: "Accept") == "image/*")
                     #expect(request.value(forHTTPHeaderField: "Authorization") == nil)
                     #expect(request.value(forHTTPHeaderField: "X-Proxy-Token") == "proxy")
@@ -41,8 +96,11 @@ struct IOSMediaArtifactLoaderTests {
         #expect(media.mimeType == "image/png")
     }
 
-    @Test @MainActor func `returns direct video stream when route needs no pinned session`() async throws {
-        let config = try Self.config(url: #require(URL(string: "wss://gateway.example")))
+    @Test(arguments: Self.gatewayRoutes)
+    @MainActor func `returns direct video stream when route needs no pinned session`(
+        route: (gateway: String, media: String)) async throws
+    {
+        let config = try Self.config(url: #require(URL(string: route.gateway)))
         let loader = IOSMediaArtifactLoader(
             connectionProvider: {
                 IOSMediaArtifactLoader.Connection(
@@ -64,7 +122,7 @@ struct IOSMediaArtifactLoaderTests {
             Issue.record("video should use the ticketed stream URL")
             return
         }
-        #expect(stream.url.absoluteString == Self.ticketedAbsoluteURL)
+        #expect(stream.url.absoluteString == route.media + Self.ticketedPath)
         #expect(stream.mimeType == "video/mp4")
         #expect(stream.sizeBytes == 4096)
     }
@@ -135,6 +193,141 @@ struct IOSMediaArtifactLoaderTests {
         #expect(media.mimeType == "video/mp4")
     }
 
+    @Test(arguments: Self.gatewayRoutes)
+    @MainActor func `requests playback rendition for buffered audio`(
+        route: (gateway: String, media: String)) async throws
+    {
+        let config = try Self.config(url: #require(URL(string: route.gateway)))
+        let loader = IOSMediaArtifactLoader(
+            connectionProvider: {
+                IOSMediaArtifactLoader.Connection(
+                    config: config,
+                    gatewayID: config.effectiveStableID,
+                    customHeaders: [:])
+            },
+            requestFactory: { _, _ in
+                { request in
+                    #expect(request.url?.absoluteString == route.media + Self.ticketedPath + "&playback=1")
+                    #expect(request.value(forHTTPHeaderField: "Range") == nil)
+                    return try Self.response(
+                        for: request,
+                        mimeType: "audio/mp4",
+                        data: Data([10, 11, 12]))
+                }
+            })
+
+        let loaded = try await loader.load(
+            response: Self.downloadResult(mimeType: "audio/x-caf"),
+            kind: .audio,
+            playback: .transcode,
+            expectedGatewayID: config.effectiveStableID)
+
+        guard case let .data(media) = loaded else {
+            Issue.record("audio rendition should be buffered")
+            return
+        }
+        #expect(media.data == Data([10, 11, 12]))
+        #expect(media.mimeType == "audio/mp4")
+    }
+
+    @Test @MainActor func `transcode playback bypasses inline bytes for ticketed rendition`() async throws {
+        let config = try Self.config(url: #require(URL(string: "wss://gateway.example")))
+        let loader = IOSMediaArtifactLoader(
+            connectionProvider: {
+                IOSMediaArtifactLoader.Connection(
+                    config: config,
+                    gatewayID: config.effectiveStableID,
+                    customHeaders: [:])
+            },
+            requestFactory: { _, _ in
+                { request in
+                    #expect(request.url?.absoluteString == Self.ticketedPlaybackAbsoluteURL)
+                    return try Self.response(
+                        for: request,
+                        mimeType: "audio/mp4",
+                        data: Data([20, 21, 22]))
+                }
+            })
+
+        let loaded = try await loader.load(
+            response: Self.downloadResult(
+                mimeType: "audio/x-caf",
+                inlineData: Data([99, 98, 97])),
+            kind: .audio,
+            playback: .transcode,
+            expectedGatewayID: config.effectiveStableID)
+
+        guard case let .data(media) = loaded else {
+            Issue.record("transcode playback should fetch the ticketed rendition")
+            return
+        }
+        #expect(media.data == Data([20, 21, 22]))
+        #expect(media.mimeType == "audio/mp4")
+    }
+
+    @Test @MainActor func `native playback retains inline byte fast path`() async throws {
+        let config = Self.config()
+        let loader = IOSMediaArtifactLoader(
+            connectionProvider: {
+                IOSMediaArtifactLoader.Connection(
+                    config: config,
+                    gatewayID: config.effectiveStableID,
+                    customHeaders: [:])
+            },
+            requestFactory: { _, _ in
+                Issue.record("native inline bytes must not reach the URL path")
+                return { _ in throw CancellationError() }
+            })
+
+        let loaded = try await loader.load(
+            response: Self.downloadResult(
+                mimeType: "audio/mpeg",
+                inlineData: Data([30, 31, 32])),
+            kind: .audio,
+            playback: .native,
+            expectedGatewayID: config.effectiveStableID)
+
+        guard case let .data(media) = loaded else {
+            Issue.record("native playback should retain inline bytes")
+            return
+        }
+        #expect(media.data == Data([30, 31, 32]))
+        #expect(media.mimeType == "audio/mpeg")
+    }
+
+    @Test @MainActor func `returns preparing for a pending streamed video rendition`() async throws {
+        let config = try Self.config(url: #require(URL(string: "wss://gateway.example")))
+        let loader = IOSMediaArtifactLoader(
+            connectionProvider: {
+                IOSMediaArtifactLoader.Connection(
+                    config: config,
+                    gatewayID: config.effectiveStableID,
+                    customHeaders: [:])
+            },
+            requestFactory: { _, _ in
+                { request in
+                    #expect(request.url?.absoluteString == Self.ticketedPlaybackAbsoluteURL)
+                    #expect(request.value(forHTTPHeaderField: "Range") == "bytes=0-0")
+                    return try Self.response(
+                        for: request,
+                        statusCode: 202,
+                        mimeType: "application/json",
+                        data: Data(#"{"status":"preparing"}"#.utf8))
+                }
+            })
+
+        let loaded = try await loader.load(
+            response: Self.downloadResult(mimeType: "video/x-matroska"),
+            kind: .video,
+            playback: .transcode,
+            expectedGatewayID: config.effectiveStableID)
+
+        guard case .preparing = loaded else {
+            Issue.record("pending rendition should remain in preparing state")
+            return
+        }
+    }
+
     @Test @MainActor func `rejects absolute and unticketed paths before fetching`() async {
         let config = Self.config()
         let loader = IOSMediaArtifactLoader(
@@ -167,13 +360,26 @@ struct IOSMediaArtifactLoaderTests {
         }
     }
 
+    private static let gatewayRoutes = [
+        (gateway: "wss://gateway.example", media: "https://gateway.example"),
+        (gateway: "wss://gateway.example/", media: "https://gateway.example"),
+        (
+            gateway: "wss://gateway.example:8443/tenant%20gateway/gw",
+            media: "https://gateway.example:8443/tenant%20gateway/gw"),
+        (
+            gateway: "wss://gateway.example/tenant%2Fgateway//gw/",
+            media: "https://gateway.example/tenant%2Fgateway//gw/"),
+        (gateway: "wss://gateway.example/tenant%FFgateway/gw", media: "https://gateway.example/tenant%FFgateway/gw"),
+    ]
     private static let ticketedPath =
         "/api/chat/media/outgoing/main/11111111-1111-4111-8111-111111111111/full?mediaTicket=ticket"
     private static let ticketedAbsoluteURL = "https://gateway.example\(ticketedPath)"
+    private static let ticketedPlaybackAbsoluteURL = "\(ticketedAbsoluteURL)&playback=1"
 
     private static func downloadResult(
         mimeType: String?,
         sizeBytes: Int? = nil,
+        inlineData: Data? = nil,
         url: String = ticketedPath) -> ArtifactsDownloadResult
     {
         ArtifactsDownloadResult(
@@ -184,18 +390,21 @@ struct IOSMediaArtifactLoaderTests {
                 mimetype: mimeType,
                 sizebytes: sizeBytes,
                 download: ["mode": AnyCodable("url")]),
+            encoding: inlineData == nil ? nil : "base64",
+            data: inlineData?.base64EncodedString(),
             url: url)
     }
 
     private static func response(
         for request: URLRequest,
+        statusCode: Int = 200,
         mimeType: String,
         data: Data) throws -> (Data, URLResponse)
     {
         let responseURL = try #require(request.url)
         let response = try #require(HTTPURLResponse(
             url: responseURL,
-            statusCode: 200,
+            statusCode: statusCode,
             httpVersion: nil,
             headerFields: ["Content-Type": mimeType]))
         return (data, response)

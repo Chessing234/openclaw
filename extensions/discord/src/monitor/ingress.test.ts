@@ -3,11 +3,12 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { APIMessage } from "discord-api-types/v10";
-import type { ChannelIngressQueue } from "openclaw/plugin-sdk/channel-outbound";
 import {
   closeOpenClawStateDatabaseForTest,
   createChannelIngressQueueForTests,
-} from "openclaw/plugin-sdk/plugin-state-test-runtime";
+} from "openclaw/plugin-sdk/channel-ingress-test-runtime";
+import type { ChannelIngressQueue } from "openclaw/plugin-sdk/channel-outbound";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDiscordIngressMonitor, type DiscordIngressLifecycle } from "./ingress.js";
@@ -51,14 +52,6 @@ function payloadFor(rawMessage: APIMessage): DiscordIngressPayload {
   return { version: 1, receivedAt: Date.now(), rawMessage };
 }
 
-function createDeferred() {
-  let resolve!: () => void;
-  const promise = new Promise<void>((innerResolve) => {
-    resolve = innerResolve;
-  });
-  return { promise, resolve };
-}
-
 async function withQueue<T>(
   fn: (queue: ChannelIngressQueue<DiscordIngressPayload>) => Promise<T>,
 ): Promise<T> {
@@ -90,8 +83,10 @@ describe("Discord durable ingress", () => {
 
   it("does not normalize or dispatch before the durable append completes", async () => {
     await withQueue(async (queue) => {
-      const appendGate = createDeferred();
+      const appendGate = createDeferred<void>();
+      const appendStarted = createDeferred<void>();
       const enqueue = vi.fn(async (...args: Parameters<typeof queue.enqueue>) => {
+        appendStarted.resolve();
         await appendGate.promise;
         return await queue.enqueue(...args);
       });
@@ -107,16 +102,46 @@ describe("Discord durable ingress", () => {
         dispatch,
       });
       monitor.start();
+      const accepted = monitor.accept(createRawMessage("1001"));
       try {
-        const accepted = monitor.accept(createRawMessage("1001"));
-        await Promise.resolve();
-
+        await Promise.race([appendStarted.promise, accepted]);
         expect(enqueue).toHaveBeenCalledTimes(1);
+
         expect(dispatch).not.toHaveBeenCalled();
 
         appendGate.resolve();
         await accepted;
         await vi.waitFor(() => expect(dispatch).toHaveBeenCalledTimes(1));
+      } finally {
+        appendGate.resolve();
+        try {
+          await accepted;
+        } finally {
+          await monitor.stop();
+        }
+      }
+    });
+  });
+
+  it("rejects unstable message identity before durable allocation", async () => {
+    await withQueue(async (queue) => {
+      const dispatch = vi.fn();
+      const monitor = createDiscordIngressMonitor({
+        accountId: "default",
+        client: {} as never,
+        runtime: runtime(),
+        queue,
+        dispatch,
+      });
+      monitor.start();
+      try {
+        const missingMessageId = { ...createRawMessage("missing"), id: undefined };
+        const missingChannelId = { ...createRawMessage("missing"), channel_id: undefined };
+
+        await expect(monitor.accept(missingMessageId as never)).rejects.toThrow("snowflake");
+        await expect(monitor.accept(missingChannelId as never)).rejects.toThrow("channel_id");
+        expect(await queue.listPending({ limit: "all" })).toEqual([]);
+        expect(dispatch).not.toHaveBeenCalled();
       } finally {
         await monitor.stop();
       }

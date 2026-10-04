@@ -1,18 +1,13 @@
-// Nextcloud Talk plugin module implements bot preflight behavior.
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { parseStrictNonNegativeInteger } from "openclaw/plugin-sdk/number-runtime";
-import {
-  readProviderJsonResponse,
-  readResponseTextLimited,
-} from "openclaw/plugin-sdk/provider-http";
+import { readProviderJsonResponse } from "openclaw/plugin-sdk/provider-http";
 import { fetchWithSsrFGuard } from "../runtime-api.js";
 import type { ResolvedNextcloudTalkAccount } from "./accounts.js";
 import { resolveNextcloudTalkApiCredentials } from "./api-credentials.js";
-import { releaseNextcloudTalkGuardedResponse } from "./guarded-response.js";
+import { readNextcloudTalkErrorBody } from "./guarded-response.js";
 import { ssrfPolicyFromPrivateNetworkOptIn } from "./send.runtime.js";
 
 const BOT_FEATURE_RESPONSE = 2;
-const BOT_PREFLIGHT_ERROR_BODY_LIMIT_BYTES = 8 * 1024;
 
 type NextcloudTalkBotAdminEntry = {
   id?: number | string;
@@ -41,23 +36,12 @@ type NextcloudTalkBotResponseFeatureProbe = {
 };
 
 function normalizeUrlForMatch(value: string | undefined): string {
-  if (!value?.trim()) {
-    return "";
-  }
-  try {
-    const url = new URL(value.trim());
+  const trimmed = value?.trim() ?? "";
+  const url = URL.parse(trimmed);
+  if (url) {
     url.hash = "";
-    return url.toString().replace(/\/$/, "");
-  } catch {
-    return value.trim().replace(/\/$/, "");
   }
-}
-
-function coerceFeatureMask(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
-    return value;
-  }
-  return parseStrictNonNegativeInteger(value);
+  return (url?.toString() ?? trimmed).replace(/\/$/, "");
 }
 
 function formatMissingResponseFeatureMessage(bot: NextcloudTalkBotAdminEntry, features?: number) {
@@ -125,15 +109,14 @@ export async function probeNextcloudTalkBotResponseFeature(params: {
         },
       },
       auditContext: "nextcloud-talk.bot-response-preflight",
-      policy: ssrfPolicyFromPrivateNetworkOptIn(account.config),
+      policy: ssrfPolicyFromPrivateNetworkOptIn(
+        account.config.network?.dangerouslyAllowPrivateNetwork,
+      ),
       timeoutMs,
     });
     try {
       if (!response.ok) {
-        const body = await readResponseTextLimited(
-          response,
-          BOT_PREFLIGHT_ERROR_BODY_LIMIT_BYTES,
-        ).catch(() => "");
+        const body = await readNextcloudTalkErrorBody(response, auth, credentials.apiPassword);
         return {
           ok: false,
           code: "api_error",
@@ -155,7 +138,7 @@ export async function probeNextcloudTalkBotResponseFeature(params: {
         };
       }
 
-      const features = coerceFeatureMask(bot.features);
+      const features = parseStrictNonNegativeInteger(bot.features);
       if (features == null || (features & BOT_FEATURE_RESPONSE) !== BOT_FEATURE_RESPONSE) {
         return {
           ok: false,
@@ -176,7 +159,7 @@ export async function probeNextcloudTalkBotResponseFeature(params: {
         message: `Nextcloud Talk bot "${bot.name ?? bot.id ?? "matching bot"}" has the response feature.`,
       };
     } finally {
-      await releaseNextcloudTalkGuardedResponse({ response, release });
+      await release();
     }
   } catch (error) {
     const detail = error instanceof Error ? error.message : formatErrorMessage(error);

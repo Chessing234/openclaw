@@ -1,15 +1,11 @@
-// Openai plugin module implements openai chatgpt oauth behavior.
 import path from "node:path";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import type { ProviderAuthContext } from "openclaw/plugin-sdk/plugin-entry";
+import type { OAuthCredentials } from "openclaw/plugin-sdk/provider-oauth-runtime";
 import { ensureGlobalUndiciEnvProxyDispatcher } from "openclaw/plugin-sdk/runtime-env";
 import { formatCliCommand } from "openclaw/plugin-sdk/setup-tools";
 import { loginOpenAICodex } from "./openai-chatgpt-oauth-flow.runtime.js";
-import {
-  runOpenAIOAuthTlsPreflight,
-  type OpenAIOAuthTlsPreflightResult,
-} from "./openai-chatgpt-oauth-preflight.runtime.js";
-import type { OAuthCredentials } from "./openai-chatgpt-oauth-types.runtime.js";
+import { runOpenAIOAuthTlsPreflight } from "./openai-chatgpt-oauth-preflight.runtime.js";
 
 const manualInputPromptMessage = "Paste the authorization code (or full redirect URL):";
 const openAICodexOAuthOriginator = "openclaw";
@@ -34,16 +30,7 @@ function resolveCertBundlePath(): string | null {
   return prefix ? path.join(prefix, "etc", "openssl@3", "cert.pem") : null;
 }
 
-function formatOpenAIOAuthTlsPreflightFix(
-  result: Exclude<OpenAIOAuthTlsPreflightResult, { ok: true }>,
-): string {
-  if (result.kind !== "tls-cert") {
-    return [
-      "OpenAI OAuth prerequisites check failed due to a network error before the browser flow.",
-      `Cause: ${result.message}`,
-      "Verify DNS/firewall/proxy access to auth.openai.com and retry.",
-    ].join("\n");
-  }
+function formatOpenAIOAuthTlsPreflightFix(result: { code?: string; message: string }): string {
   const certBundlePath = resolveCertBundlePath();
   const lines = [
     "OpenAI OAuth prerequisites check failed: Node/OpenSSL cannot validate TLS certificates.",
@@ -65,25 +52,13 @@ function settleAfterDelay(params: {
   waitForLoginToSettle: Promise<void>;
 }): Promise<"delay" | "settled"> {
   return new Promise((resolve) => {
-    let done = false;
-    const complete = (outcome: "delay" | "settled") => {
-      if (done) {
-        return;
-      }
-      done = true;
+    const complete = () => {
       clearTimeout(timer);
-      resolve(outcome);
+      resolve("settled");
     };
-    const timer = setTimeout(() => complete("delay"), params.delayMs);
-    params.waitForLoginToSettle.then(
-      () => complete("settled"),
-      () => complete("settled"),
-    );
+    const timer = setTimeout(() => resolve("delay"), params.delayMs);
+    params.waitForLoginToSettle.then(complete, complete);
   });
-}
-
-function waitForeverForPromptInput(): Promise<string> {
-  return new Promise<string>(() => {});
 }
 
 function createOpenAICodexOAuthError(
@@ -122,16 +97,9 @@ function createManualCodeInputHandler(params: {
   stopProgress: (message?: string) => void;
   waitForLoginToSettle: Promise<void>;
   hasBrowserAuthStarted: () => boolean;
-}): (() => Promise<string>) | undefined {
+}): () => Promise<string> {
   let manualFallbackPromise: Promise<string> | undefined;
   const promptForManualCode = () => params.onPrompt({ message: manualInputPromptMessage });
-  if (params.isRemote) {
-    return async () => {
-      manualFallbackPromise ??= promptForManualCode();
-      return await manualFallbackPromise;
-    };
-  }
-
   const switchToManualEntry = async (progressMessage: string, logMessage?: string) => {
     params.updateProgress(progressMessage);
     if (logMessage) {
@@ -149,19 +117,14 @@ function createManualCodeInputHandler(params: {
       );
     }
 
-    const firstWait = await settleAfterDelay({
-      delayMs: localManualFallbackDelayMs,
-      waitForLoginToSettle: params.waitForLoginToSettle,
-    });
-    if (firstWait === "settled") {
-      return await waitForeverForPromptInput();
-    }
-    const graceWait = await settleAfterDelay({
-      delayMs: localManualFallbackGraceMs,
-      waitForLoginToSettle: params.waitForLoginToSettle,
-    });
-    if (graceWait === "settled") {
-      return await waitForeverForPromptInput();
+    for (const delayMs of [localManualFallbackDelayMs, localManualFallbackGraceMs]) {
+      const outcome = await settleAfterDelay({
+        delayMs,
+        waitForLoginToSettle: params.waitForLoginToSettle,
+      });
+      if (outcome === "settled") {
+        return await new Promise<string>(() => {});
+      }
     }
     return await switchToManualEntry(
       "Browser callback did not finish. Paste the redirect URL to continue...",
@@ -170,7 +133,7 @@ function createManualCodeInputHandler(params: {
   };
 
   return async () => {
-    manualFallbackPromise ??= runLocalManualFallback();
+    manualFallbackPromise ??= params.isRemote ? promptForManualCode() : runLocalManualFallback();
     return await manualFallbackPromise;
   };
 }
@@ -182,6 +145,7 @@ export async function loginOpenAICodexOAuth(params: {
   isRemote: boolean;
   openUrl: (url: string) => Promise<void>;
   signal?: AbortSignal;
+  assertCurrent?: () => void;
   onManualCodeInput?: () => Promise<string>;
   localBrowserMessage?: string;
 }): Promise<OAuthCredentials | null> {
@@ -189,7 +153,11 @@ export async function loginOpenAICodexOAuth(params: {
 
   ensureGlobalUndiciEnvProxyDispatcher();
 
-  const preflight = await runOpenAIOAuthTlsPreflight();
+  const preflight = await runOpenAIOAuthTlsPreflight({
+    signal: params.signal,
+    assertCurrent: params.assertCurrent,
+  });
+  params.assertCurrent?.();
   if (!preflight.ok && preflight.kind === "tls-cert") {
     const hint = formatOpenAIOAuthTlsPreflightFix(preflight);
     await prompter.note(hint, "OAuth prerequisites");
@@ -243,13 +211,11 @@ export async function loginOpenAICodexOAuth(params: {
       manualPromptMessage: manualInputPromptMessage,
       manualPromptSignal: manualPromptAbort.signal,
     });
-    const onAuth = async (event: Parameters<typeof baseOnAuth>[0]) => {
-      browserAuthStarted = true;
-      await baseOnAuth(event);
-    };
-
     const creds = await loginOpenAICodex({
-      onAuth,
+      onAuth: async (event) => {
+        browserAuthStarted = true;
+        await baseOnAuth(event);
+      },
       onPrompt,
       originator: openAICodexOAuthOriginator,
       onManualCodeInput:
@@ -263,8 +229,9 @@ export async function loginOpenAICodexOAuth(params: {
           waitForLoginToSettle,
           hasBrowserAuthStarted: () => browserAuthStarted,
         }),
-      onProgress: (msg: string) => updateProgress(msg),
+      onProgress: updateProgress,
       signal: params.signal,
+      assertCurrent: params.assertCurrent,
     });
     stopProgress("OpenAI OAuth complete");
     return creds ?? null;

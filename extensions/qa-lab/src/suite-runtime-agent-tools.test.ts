@@ -23,21 +23,17 @@ const stdioTransportMock = vi.hoisted(() =>
 );
 
 vi.mock("@modelcontextprotocol/sdk/client/index.js", () => ({
-  Client: vi
-    .fn()
-    .mockImplementation(
-      function Client(this: {
-        connect?: typeof connectMock;
-        listTools?: typeof listToolsMock;
-        callTool?: typeof callToolMock;
-        close?: typeof closeMock;
-      }) {
-        this.connect = connectMock;
-        this.listTools = listToolsMock;
-        this.callTool = callToolMock;
-        this.close = closeMock;
-      },
-    ),
+  Client: vi.fn().mockImplementation(function Client(this: {
+    connect?: typeof connectMock;
+    listTools?: typeof listToolsMock;
+    callTool?: typeof callToolMock;
+    close?: typeof closeMock;
+  }) {
+    this.connect = connectMock;
+    this.listTools = listToolsMock;
+    this.callTool = callToolMock;
+    this.close = closeMock;
+  }),
 }));
 
 vi.mock("@modelcontextprotocol/sdk/client/stdio.js", () => ({
@@ -124,7 +120,7 @@ describe("qa suite runtime agent tools helpers", () => {
     ).resolves.toEqual("done");
   });
 
-  it("calls plugin-tools MCP through the resolved node executable", async () => {
+  it("falls back to the source plugin-tools MCP entry", async () => {
     listToolsMock.mockResolvedValueOnce({
       tools: [{ name: "plugin.echo" }] as never[],
     });
@@ -178,6 +174,35 @@ describe("qa suite runtime agent tools helpers", () => {
       { timeout: 180_000 },
     );
     expect(closeMock).toHaveBeenCalled();
+  });
+
+  it("prefers the built plugin-tools MCP entry", async () => {
+    const builtRepoRoot = await makeTempDir("qa-built-repo-");
+    const distEntry = path.join(builtRepoRoot, "dist", "mcp", "plugin-tools-serve.js");
+    await fs.mkdir(path.dirname(distEntry), { recursive: true });
+    await fs.writeFile(distEntry, "// built MCP entry\n", "utf8");
+    listToolsMock.mockResolvedValueOnce({
+      tools: [{ name: "plugin.echo" }] as never[],
+    });
+
+    await callPluginToolsMcp({
+      env: {
+        gateway: {
+          tempRoot: gatewayTempRoot,
+          runtimeEnv: { PATH: "/usr/bin" },
+        },
+        repoRoot: builtRepoRoot,
+      } as never,
+      toolName: "plugin.echo",
+      args: {},
+    });
+
+    expect(stdioTransportMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        command: "/usr/bin/node",
+        args: [distEntry],
+      }),
+    );
   });
 
   it("reports available plugin-tools MCP names when the requested tool is missing", async () => {

@@ -12,7 +12,7 @@ import {
 } from "./resolve-errors.js";
 import { resolveSecretRefValues, resolveSecretRefValuesSettledByProvider } from "./resolve.js";
 import { getSecretAssignmentSource } from "./runtime-assignment-provenance.js";
-import { resolveAuthProfileSecretOwnerId } from "./runtime-auth-profile-owner.js";
+import { listAuthProfileSecretOwnerIds } from "./runtime-auth-profile-owner.js";
 import type {
   DegradedSecretOwner,
   SecretDegradationReason,
@@ -31,7 +31,7 @@ import {
   type SecretAssignment,
 } from "./runtime-shared.js";
 import {
-  getActiveSecretsRuntimeSnapshot,
+  getActiveSecretsRuntimeSnapshotState,
   hasSameSecretProviderDefinition,
 } from "./runtime-state.js";
 
@@ -44,8 +44,12 @@ export function classifySecretOwnerDegradationState(params: {
   refs: SecretRef[];
   config: OpenClawConfig;
   contractDigest?: string;
+  forceColdRefKeys?: ReadonlySet<string>;
 }): "cold" | "stale" {
-  const active = getActiveSecretsRuntimeSnapshot();
+  if (params.refs.some((ref) => params.forceColdRefKeys?.has(secretRefKey(ref)))) {
+    return "cold";
+  }
+  const active = getActiveSecretsRuntimeSnapshotState();
   if (
     !active ||
     active.degradedOwners?.some(
@@ -85,6 +89,25 @@ function assignmentOwnerKey(assignment: SecretAssignment): string {
   return `${getSecretAssignmentSource(assignment)}\0${assignment.ownerKind}\0${assignment.ownerId}`;
 }
 
+const AUTH_STORE_PROVIDER_UNCONFIGURED_REASON = "secret provider is not configured" as const;
+
+function resolveOwnerFailureReason(params: {
+  assignments: SecretAssignment[];
+  error: unknown;
+  fallback: SecretDegradationReason | undefined;
+}): SecretDegradationReason | undefined {
+  if (params.fallback) {
+    return params.fallback;
+  }
+  const owner = params.assignments[0];
+  return owner &&
+    getSecretAssignmentSource(owner) === "auth-store" &&
+    isProviderScopedSecretResolutionError(params.error) &&
+    params.error.code === "SECRET_PROVIDER_NOT_CONFIGURED"
+    ? AUTH_STORE_PROVIDER_UNCONFIGURED_REASON
+    : undefined;
+}
+
 function groupAssignmentsByOwner(assignments: SecretAssignment[]): SecretAssignment[][] {
   const groups = new Map<string, SecretAssignment[]>();
   for (const assignment of assignments) {
@@ -108,6 +131,14 @@ function groupAssignmentsByOwner(assignments: SecretAssignment[]): SecretAssignm
   return [...groups.values()];
 }
 
+function assignmentOwnerContractDigest(assignments: SecretAssignment[]): string | undefined {
+  return combineSecretOwnerContractDigests(
+    assignments.flatMap((assignment) =>
+      assignment.ownerContractDigest ? [assignment.ownerContractDigest] : [],
+    ),
+  );
+}
+
 /** Captures every typed owner/ref relationship for later reload classification. */
 export function listSecretAssignmentOwners(
   assignments: SecretAssignment[],
@@ -122,11 +153,7 @@ export function listSecretAssignmentOwners(
             ownerKind: owner.ownerKind,
             ownerId: owner.ownerId,
             refKeys: ownerAssignments.map((assignment) => secretRefKey(assignment.ref)).toSorted(),
-            contractDigest: combineSecretOwnerContractDigests(
-              ownerAssignments.flatMap((assignment) =>
-                assignment.ownerContractDigest ? [assignment.ownerContractDigest] : [],
-              ),
-            ),
+            contractDigest: assignmentOwnerContractDigest(ownerAssignments),
             resolvedValues: ownerAssignments.flatMap((assignment) => {
               const refKey = secretRefKey(assignment.ref);
               return resolvedValues.has(refKey)
@@ -166,6 +193,7 @@ function associateAssignmentFailureOwners(params: {
   assignments: SecretAssignment[];
   error: unknown;
   config: OpenClawConfig;
+  forceColdRefKeys?: ReadonlySet<string>;
 }): void {
   const validationFailures = getSecretAssignmentValidationFailures(params.error);
   const validationFailureRefKeys = new Set(validationFailures.map((failure) => failure.refKey));
@@ -182,11 +210,14 @@ function associateAssignmentFailureOwners(params: {
         .map(assignmentOwnerKey),
     ),
   );
-  const reason =
+  const sharedReason =
     validationFailures.length > 0
       ? "resolved secret value was invalid"
       : describeSecretResolutionError(params.error);
-  if (!reason) {
+  const authStoreProviderUnconfigured =
+    isProviderScopedSecretResolutionError(params.error) &&
+    params.error.code === "SECRET_PROVIDER_NOT_CONFIGURED";
+  if (!sharedReason && !authStoreProviderUnconfigured) {
     return;
   }
   const owners = groupAssignmentsByOwner(params.assignments).flatMap((assignments) => {
@@ -201,6 +232,14 @@ function associateAssignmentFailureOwners(params: {
     if (!failureMatched) {
       return [];
     }
+    const reason = resolveOwnerFailureReason({
+      assignments,
+      error: params.error,
+      fallback: sharedReason,
+    });
+    if (!reason) {
+      return [];
+    }
     const degradedOwner = createDegradedOwner(assignments, reason);
     return [
       {
@@ -210,11 +249,8 @@ function associateAssignmentFailureOwners(params: {
           ownerId: degradedOwner.ownerId,
           refs: assignments.map((assignment) => assignment.ref),
           config: params.config,
-          contractDigest: combineSecretOwnerContractDigests(
-            assignments.flatMap((assignment) =>
-              assignment.ownerContractDigest ? [assignment.ownerContractDigest] : [],
-            ),
-          ),
+          contractDigest: assignmentOwnerContractDigest(assignments),
+          forceColdRefKeys: params.forceColdRefKeys,
         }),
         failureMatched,
         source: getSecretAssignmentSource(assignments[0]!),
@@ -222,13 +258,13 @@ function associateAssignmentFailureOwners(params: {
     ];
   });
   const failureRefs = new Map(
-    validationFailures.length > 0
-      ? params.assignments
-          .filter((assignment) => validationFailureRefKeys.has(secretRefKey(assignment.ref)))
-          .map((assignment) => [secretRefKey(assignment.ref), assignment.ref] as const)
-      : params.assignments
-          .filter((assignment) => assignmentMatchesResolutionFailure(assignment, params.error))
-          .map((assignment) => [secretRefKey(assignment.ref), assignment.ref] as const),
+    params.assignments
+      .filter((assignment) =>
+        validationFailures.length > 0
+          ? validationFailureRefKeys.has(secretRefKey(assignment.ref))
+          : assignmentMatchesResolutionFailure(assignment, params.error),
+      )
+      .map((assignment) => [secretRefKey(assignment.ref), assignment.ref] as const),
   );
   const providerFailure =
     validationFailures.length === 0 && isProviderScopedSecretResolutionError(params.error)
@@ -241,14 +277,8 @@ function associateAssignmentFailureOwners(params: {
     owners.map((owner) => `${owner.source}\0${owner.ownerKind}\0${owner.ownerId}`),
   );
   const collectedOwnerKeys = new Set(params.assignments.map(assignmentOwnerKey));
-  const activeSnapshot = getActiveSecretsRuntimeSnapshot();
-  const activeAuthOwnerIds = new Set(
-    (activeSnapshot?.authStores ?? []).flatMap(({ agentDir, store }) =>
-      Object.keys(store.profiles).map((profileId) =>
-        resolveAuthProfileSecretOwnerId({ agentDir, profileId }),
-      ),
-    ),
-  );
+  const activeSnapshot = getActiveSecretsRuntimeSnapshotState();
+  const activeAuthOwnerIds = listAuthProfileSecretOwnerIds(activeSnapshot?.authStores ?? []);
   const activeCoOwners = (activeSnapshot?.secretOwners ?? []).flatMap((owner) => {
     const source =
       owner.ownerKind === "account" && activeAuthOwnerIds.has(owner.ownerId)
@@ -279,6 +309,14 @@ function associateAssignmentFailureOwners(params: {
     if (refs.length === 0) {
       return [];
     }
+    const reason =
+      sharedReason ??
+      (source === "auth-store" && authStoreProviderUnconfigured
+        ? AUTH_STORE_PROVIDER_UNCONFIGURED_REASON
+        : undefined);
+    if (!reason) {
+      return [];
+    }
     return [
       {
         ownerKind: owner.ownerKind,
@@ -293,6 +331,7 @@ function associateAssignmentFailureOwners(params: {
           refs,
           config: params.config,
           contractDigest: owner.contractDigest,
+          forceColdRefKeys: params.forceColdRefKeys,
         }),
         failureMatched: true,
         source,
@@ -319,6 +358,7 @@ export function warnDegradedSecretOwner(
 async function resolveStrictAssignments(params: {
   assignments: SecretAssignment[];
   options: SecretResolutionOptions;
+  forceColdRefKeys?: ReadonlySet<string>;
 }): Promise<Map<string, unknown>> {
   try {
     const resolved = await resolveSecretRefValues(
@@ -333,6 +373,7 @@ async function resolveStrictAssignments(params: {
       assignments: params.assignments,
       error,
       config: params.options.config,
+      forceColdRefKeys: params.forceColdRefKeys,
     });
     throw error;
   }
@@ -355,10 +396,18 @@ function assertOwnerCanBeIsolated(
   error: unknown,
 ): SecretDegradationReason {
   const owner = assignments[0]!;
-  const reason = describeSecretResolutionError(error);
+  const reason = resolveOwnerFailureReason({
+    assignments,
+    error,
+    fallback: describeSecretResolutionError(error),
+  });
+  const isolatableFailure =
+    reason === AUTH_STORE_PROVIDER_UNCONFIGURED_REASON ||
+    reason === "resolved secret value is a redaction placeholder" ||
+    (reason !== undefined && isRetryableSecretDegradationReason(reason));
   if (
     !reason ||
-    !isRetryableSecretDegradationReason(reason) ||
+    !isolatableFailure ||
     owner.ownerKind === "unknown" ||
     owner.requiredForGateway ||
     owner.disposition === "fail-closed"
@@ -373,6 +422,7 @@ export async function resolveAndApplySecretAssignments(params: {
   context: ResolverContext;
   options: SecretResolutionOptions;
   allowOwnerIsolation?: boolean;
+  forceColdRefKeys?: ReadonlySet<string>;
 }): Promise<{ degradedOwners: DegradedSecretOwner[]; resolvedValues: Map<string, unknown> }> {
   if (!params.allowOwnerIsolation) {
     return {
@@ -404,6 +454,7 @@ export async function resolveAndApplySecretAssignments(params: {
         assignments: pendingOwners.flat(),
         error: failure.error,
         config: params.options.config,
+        forceColdRefKeys: params.forceColdRefKeys,
       });
       const matchingOwners = pendingOwners.filter((assignments) =>
         assignments.some((assignment) =>
@@ -434,7 +485,11 @@ export async function resolveAndApplySecretAssignments(params: {
           )
         ) {
           existing.providerFailures.push(providerFailure);
-        } else if (!providerFailure && !existing.refFailureReason) {
+        } else if (
+          !providerFailure &&
+          (!existing.refFailureReason ||
+            reason === "resolved secret value is a redaction placeholder")
+        ) {
           existing.refFailureReason = reason;
         }
       }
@@ -461,6 +516,7 @@ export async function resolveAndApplySecretAssignments(params: {
           assignments: readyAssignments,
           error,
           config: params.options.config,
+          forceColdRefKeys: params.forceColdRefKeys,
         });
         throw error;
       }
@@ -476,15 +532,15 @@ export async function resolveAndApplySecretAssignments(params: {
           ownerId: owner.ownerId,
           refs: assignments.map((assignment) => assignment.ref),
           config: params.options.config,
-          contractDigest: combineSecretOwnerContractDigests(
-            assignments.flatMap((assignment) =>
-              assignment.ownerContractDigest ? [assignment.ownerContractDigest] : [],
-            ),
-          ),
+          contractDigest: assignmentOwnerContractDigest(assignments),
+          forceColdRefKeys: params.forceColdRefKeys,
         });
+        if (failure.refFailureReason === "resolved secret value is a redaction placeholder") {
+          degradationState = "cold";
+        }
         const activeOwner =
           degradationState === "stale"
-            ? getActiveSecretsRuntimeSnapshot()?.secretOwners?.find(
+            ? getActiveSecretsRuntimeSnapshotState()?.secretOwners?.find(
                 (entry) => entry.ownerKind === owner.ownerKind && entry.ownerId === owner.ownerId,
               )
             : undefined;

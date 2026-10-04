@@ -1,4 +1,3 @@
-// Imessage plugin module implements probe behavior.
 import path from "node:path";
 import type { BaseProbeResult } from "openclaw/plugin-sdk/channel-contract";
 import {
@@ -10,10 +9,12 @@ import { getRuntimeConfig } from "openclaw/plugin-sdk/runtime-config-snapshot";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
 import { detectBinary } from "openclaw/plugin-sdk/setup";
 import {
+  filterStringEntries,
   normalizeLowercaseStringOrEmpty,
   normalizeStringEntries,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
+import { expandIMessageUserPath } from "./cli-path.js";
 import { createIMessageRpcClient } from "./client.js";
 import { DEFAULT_IMESSAGE_PROBE_TIMEOUT_MS } from "./constants.js";
 import {
@@ -21,6 +22,7 @@ import {
   setCachedIMessagePrivateApiStatus,
   type IMessagePrivateApiStatus,
 } from "./private-api-status.js";
+import { resolveIMessageRemoteHost } from "./remote-host.js";
 import {
   IMESSAGE_INSTALL_COMMAND,
   IMESSAGE_UPDATE_COMMAND,
@@ -42,6 +44,7 @@ export type IMessageProbe = BaseProbeResult & {
 export type IMessageProbeOptions = {
   cliPath?: string;
   dbPath?: string;
+  remoteHost?: string;
   forceRefresh?: boolean;
   platform?: NodeJS.Platform;
   runtime?: RuntimeEnv;
@@ -120,7 +123,9 @@ async function probeRpcSupport(cliPath: string, timeoutMs: number): Promise<RpcS
     return cached;
   }
   try {
-    const result = await runCommandWithTimeout([cliPath, "rpc", "--help"], { timeoutMs });
+    const result = await runCommandWithTimeout([expandIMessageUserPath(cliPath), "rpc", "--help"], {
+      timeoutMs,
+    });
     const combined = `${result.stdout}\n${result.stderr}`.trim();
     const normalized = normalizeLowercaseStringOrEmpty(combined);
     if (normalized.includes("unknown command") && normalized.includes("rpc")) {
@@ -182,47 +187,23 @@ function selectorsFromPayload(payload: Record<string, unknown>): Record<string, 
   return selectors;
 }
 
-function rpcMethodsFromPayload(payload: Record<string, unknown>): string[] {
-  const raw = payload.rpc_methods;
-  if (!Array.isArray(raw)) {
-    return [];
-  }
-  return raw.filter((entry): entry is string => typeof entry === "string");
-}
-
-// Probe whether the installed imsg CLI accepts `--file` on the `send-rich`
-// subcommand (added by openclaw/imsg#114, which lets a single bridge call
-// combine `--reply-to` and an attachment). We grep the help output rather
-// than trying a real send so the probe is side-effect-free, and we resolve
-// to `false` on any failure (timeout, non-zero exit, missing binary) so
-// callers fall back to the legacy throw rather than silently dropping.
-async function probeSendRichSupportsAttachment(
+// Inspect help without sending; failed probes leave the capability disabled.
+async function probeIMessageCliFlag(
   cliPath: string,
   timeoutMs: number,
+  command: string[],
+  flag: RegExp,
 ): Promise<boolean> {
   try {
-    const result = await runCommandWithTimeout([cliPath, "send-rich", "--help"], { timeoutMs });
+    const result = await runCommandWithTimeout(
+      [expandIMessageUserPath(cliPath), ...command, "--help"],
+      { timeoutMs },
+    );
     if (result.code !== 0) {
       return false;
     }
     const combined = `${result.stdout}\n${result.stderr}`;
-    return /(?:^|\s)--file\b/m.test(combined);
-  } catch {
-    return false;
-  }
-}
-
-async function probePollSendSupportsNoComment(
-  cliPath: string,
-  timeoutMs: number,
-): Promise<boolean> {
-  try {
-    const result = await runCommandWithTimeout([cliPath, "poll", "send", "--help"], { timeoutMs });
-    if (result.code !== 0) {
-      return false;
-    }
-    const combined = `${result.stdout}\n${result.stderr}`;
-    return /(?:^|\s)--no-comment\b/m.test(combined);
+    return flag.test(combined);
   } catch {
     return false;
   }
@@ -241,7 +222,9 @@ export async function probeIMessagePrivateApi(
     }
   }
   try {
-    const result = await runCommandWithTimeout([key, "status", "--json"], { timeoutMs });
+    const result = await runCommandWithTimeout([expandIMessageUserPath(key), "status", "--json"], {
+      timeoutMs,
+    });
     const combined = `${result.stdout}\n${result.stderr}`.trim();
     const normalized = normalizeLowercaseStringOrEmpty(combined);
     if (
@@ -265,23 +248,28 @@ export async function probeIMessagePrivateApi(
     }
     const { payload, firstLineSnippet } = parseStatusPayload(result.stdout);
     const selectors = payload ? selectorsFromPayload(payload) : {};
-    const rpcMethods = payload ? rpcMethodsFromPayload(payload) : [];
+    const rpcMethods = filterStringEntries(payload?.rpc_methods);
     const advancedFeatures = payload?.advanced_features === true;
     const v2Ready = payload?.v2_ready === true;
     // imsg explains an unavailable bridge here (SIP, library validation, macOS
     // 26 AMFI gate). Carry it forward so blocked actions can show the reason.
     const statusMessage = typeof payload?.message === "string" ? payload.message : undefined;
-    // Probe `imsg send-rich --help` for the `--file` flag added by
-    // openclaw/imsg#114. We do this even when the bridge is unavailable
-    // because the help output ships with the CLI binary itself, and the
-    // result is what gates whether reply-with-attachment can route through
-    // the threaded send path. Treat any failure as "not supported" so
-    // callers fall back to the legacy throw rather than silently dropping.
-    const sendRichSupportsAttachment = await probeSendRichSupportsAttachment(key, timeoutMs);
+    // CLI flags remain discoverable while the native bridge is unavailable.
+    const sendRichSupportsAttachment = await probeIMessageCliFlag(
+      key,
+      timeoutMs,
+      ["send-rich"],
+      /(?:^|\s)--file\b/m,
+    );
     // Caption suppression is required for approval polls because OpenClaw
     // renders the details first. Published imsg 0.13.1 lacks --no-comment, so
     // probe the exact CLI contract instead of inferring it from poll selectors.
-    const pollSendSupportsNoComment = await probePollSendSupportsNoComment(key, timeoutMs);
+    const pollSendSupportsNoComment = await probeIMessageCliFlag(
+      key,
+      timeoutMs,
+      ["poll", "send"],
+      /(?:^|\s)--no-comment\b/m,
+    );
     const status: NonNullable<IMessageProbe["privateApi"]> = {
       available: result.code === 0 && advancedFeatures && v2Ready,
       v2Ready,
@@ -318,11 +306,6 @@ export async function probeIMessagePrivateApi(
   }
 }
 
-/**
- * Probe iMessage RPC availability.
- * @param timeoutMs - Explicit timeout in ms. If undefined, uses config or default.
- * @param opts - Additional options (cliPath, dbPath, runtime).
- */
 export async function probeIMessage(
   timeoutMs?: number,
   opts: IMessageProbeOptions = {},
@@ -331,7 +314,10 @@ export async function probeIMessage(
   const explicitCliPath = opts.cliPath?.trim() || cfg?.channels?.imessage?.cliPath?.trim();
   const cliPath = explicitCliPath || "imsg";
   const dbPath = opts.dbPath?.trim() || cfg?.channels?.imessage?.dbPath?.trim();
-  // Use explicit timeout if provided, otherwise fall back to config, then default
+  const remoteHost = await resolveIMessageRemoteHost({
+    cliPath,
+    remoteHost: opts.remoteHost ?? cfg?.channels?.imessage?.remoteHost,
+  });
   const effectiveTimeout =
     timeoutMs ?? cfg?.channels?.imessage?.probeTimeoutMs ?? DEFAULT_IMESSAGE_PROBE_TIMEOUT_MS;
 
@@ -340,7 +326,7 @@ export async function probeIMessage(
     return { ok: false, fatal: true, error: nonMacHostError };
   }
 
-  const detected = await detectBinary(cliPath);
+  const detected = await detectBinary(expandIMessageUserPath(cliPath));
   if (!detected) {
     const error = isAutoManagedIMessageCliPath(cliPath, {
       explicit: explicitCliPath !== undefined,
@@ -369,6 +355,7 @@ export async function probeIMessage(
   const client = await createIMessageRpcClient({
     cliPath,
     dbPath,
+    remoteHost,
     runtime: opts.runtime,
   });
   try {

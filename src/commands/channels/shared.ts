@@ -1,4 +1,4 @@
-// Shared config loading and account-line formatting helpers for channel commands.
+import { sanitizeTerminalText } from "../../../packages/terminal-core/src/safe-text.js";
 import { hasConfiguredUnavailableCredentialStatus } from "../../channels/account-snapshot-fields.js";
 import type { ChannelId } from "../../channels/plugins/types.public.js";
 import { resolveCommandConfigWithSecrets } from "../../cli/command-config-resolution.js";
@@ -7,25 +7,28 @@ import { getChannelsCommandSecretTargetIds } from "../../cli/command-secret-targ
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { DEFAULT_ACCOUNT_ID } from "../../routing/session-key.js";
 import { defaultRuntime, type RuntimeEnv } from "../../runtime.js";
-import {
-  requireValidConfigFileSnapshot,
-  requireValidConfigSnapshot,
-} from "../config-validation.js";
+import { requireValidConfig, requireValidConfigForWrite } from "../config-validation.js";
 
 export type ChatChannel = ChannelId;
 
-export { requireValidConfigSnapshot };
-export { requireValidConfigFileSnapshot };
+export const NO_CONFIGURED_CHAT_CHANNELS_LINE =
+  "- no configured chat channels (run `openclaw channels list --all` to see installable channels)";
+
+export { requireValidConfigForWrite };
 
 /** Load valid channel command config with read-only secret resolution applied. */
-export async function requireValidConfig(
+export async function requireValidChannelConfig(
   runtime: RuntimeEnv = defaultRuntime,
   secretResolution?: {
     commandName?: string;
     mode?: CommandSecretResolutionMode;
+    skipPluginValidation?: boolean;
   },
 ): Promise<OpenClawConfig | null> {
-  const cfg = await requireValidConfigSnapshot(runtime);
+  const cfg = await requireValidConfig(
+    runtime,
+    secretResolution?.skipPluginValidation ? { skipPluginValidation: true } : undefined,
+  );
   if (!cfg) {
     return null;
   }
@@ -40,14 +43,13 @@ export async function requireValidConfig(
 }
 
 function formatAccountLabel(params: { accountId: string; name?: string }) {
-  const base = params.accountId || DEFAULT_ACCOUNT_ID;
+  const base = sanitizeTerminalText(params.accountId || DEFAULT_ACCOUNT_ID);
   if (params.name?.trim()) {
-    return `${base} (${params.name.trim()})`;
+    return `${base} (${sanitizeTerminalText(params.name.trim())})`;
   }
   return base;
 }
 
-/** Format a channel/account label with optional display styles for terminal output. */
 export function formatChannelAccountLabel(params: {
   channel: ChatChannel;
   accountId: string;
@@ -56,7 +58,7 @@ export function formatChannelAccountLabel(params: {
   channelStyle?: (value: string) => string;
   accountStyle?: (value: string) => string;
 }): string {
-  const channelText = params.channelLabel ?? params.channel;
+  const channelText = sanitizeTerminalText(params.channelLabel ?? params.channel);
   const accountText = formatAccountLabel({
     accountId: params.accountId,
     name: params.name,
@@ -101,7 +103,6 @@ export function appendEnabledConfiguredLinkedBits(
   }
 }
 
-/** Append account mode metadata when present. */
 export function appendModeBit(bits: string[], account: Record<string, unknown>) {
   if (typeof account.mode === "string" && account.mode.length > 0) {
     bits.push(`mode:${account.mode}`);
@@ -126,14 +127,12 @@ export function appendTokenSourceBits(bits: string[], account: Record<string, un
   appendSourceBit("signing", "signingSecretSource", "signingSecretStatus");
 }
 
-/** Append account base URL metadata when present. */
 export function appendBaseUrlBit(bits: string[], account: Record<string, unknown>) {
   if (typeof account.baseUrl === "string" && account.baseUrl) {
     bits.push(`url:${account.baseUrl}`);
   }
 }
 
-/** Build a complete human-readable channel account status line. */
 export function buildChannelAccountLine(
   provider: ChatChannel,
   account: Record<string, unknown>,
@@ -149,9 +148,4 @@ export function buildChannelAccountLine(
     channelLabel: opts?.channelLabel,
   });
   return `- ${labelText}: ${bits.join(", ")}`;
-}
-
-/** Return true when the command should use its interactive wizard path. */
-export function shouldUseWizard(params?: { hasFlags?: boolean }) {
-  return params?.hasFlags === false;
 }

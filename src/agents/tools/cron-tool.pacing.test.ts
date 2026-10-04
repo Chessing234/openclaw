@@ -3,7 +3,7 @@ import {
   claimAgentRunContext,
   clearAgentRunContext,
   consumeCronNextCheckProposal,
-} from "../../infra/agent-events.js";
+} from "../../infra/agent-run-registry.js";
 import { createCronTool } from "./cron-tool.js";
 
 const RUN_ID = "paced-run";
@@ -28,19 +28,6 @@ function registerRun(pacingEnabled: boolean) {
 }
 
 describe("cron next_check action", () => {
-  it("lets a restricted isolated run record a proposal for its own paced job", async () => {
-    registerRun(true);
-
-    const result = await createScopedTool().execute("call-next-check", {
-      action: "next_check",
-      in: "1h30m",
-    });
-
-    expect(result.details).toEqual({ ok: true, delayMs: 90 * 60_000 });
-    expect(consumeCronNextCheckProposal(RUN_ID, JOB_ID)).toBe(90 * 60_000);
-    expect(consumeCronNextCheckProposal(RUN_ID, JOB_ID)).toBeUndefined();
-  });
-
   it("accepts an explicit matching job id", async () => {
     registerRun(true);
 
@@ -52,6 +39,7 @@ describe("cron next_check action", () => {
 
     expect(result.details).toEqual({ ok: true, delayMs: 45 * 60_000 });
     expect(consumeCronNextCheckProposal(RUN_ID, JOB_ID)).toBe(45 * 60_000);
+    expect(consumeCronNextCheckProposal(RUN_ID, JOB_ID)).toBeUndefined();
   });
 
   it("rejects a proposal when the current job has no pacing", async () => {
@@ -71,7 +59,7 @@ describe("cron next_check action", () => {
         jobId: "another-job",
         in: "15m",
       }),
-    ).rejects.toThrow("Cron tool is restricted to the current cron job.");
+    ).rejects.toThrow("Automations tool is restricted to the current automation.");
   });
 
   it("rejects next_check outside a current cron run", async () => {

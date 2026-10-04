@@ -1,56 +1,51 @@
-// Startup/Doctor migration for the retired restart-sentinel JSON file.
-import { createHash } from "node:crypto";
+// Doctor and restart recovery share custody of notifications written by older updaters.
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { root, type Root } from "@openclaw/fs-safe";
-import type { DB as OpenClawStateKyselyDatabase } from "../state/openclaw-state-db.generated.js";
-import {
-  openOpenClawStateDatabase,
-  runOpenClawStateWriteTransaction,
-} from "../state/openclaw-state-db.js";
-import { formatErrorMessage } from "./errors.js";
-import { acquireGatewayLock, GatewayLockError } from "./gateway-lock.js";
-import {
-  executeSqliteQuerySync,
-  executeSqliteQueryTakeFirstSync,
-  getNodeSqliteKysely,
-} from "./kysely-sync.js";
+import { runOpenClawStateWriteTransaction } from "../state/openclaw-state-db.js";
 import {
   parseRestartSentinelEnvelope,
   readRestartSentinelRowSync,
+  readRestartSentinelSnapshotSync,
   writeRestartSentinelRowSync,
   type RestartSentinelEnvelope,
 } from "./restart-sentinel-store.js";
+import { withLegacyMigrationStateLock } from "./state-migrations.lock.js";
+import {
+  markLegacyMigrationSourceRemoved,
+  readLegacyMigrationReceiptFromDatabase,
+  recordLegacyMigrationReceipt,
+  resolveLegacyMigrationSourceKey,
+} from "./state-migrations.receipts.js";
+import {
+  MIGRATION_KIND,
+  canFinalizeImportedUpdate,
+  hasImportedPendingHandoff,
+  hasLegacyPathWideReceipt,
+  readCanonicalImport,
+  readSourceDecision,
+  sourceRunId,
+  type RestartSentinelMigrationDecision as MigrationDecision,
+} from "./state-migrations.restart-sentinel-receipts.js";
 import type { LegacyRestartSentinelDetection } from "./state-migrations.restart-sentinel.types.js";
 import {
+  LegacyMigrationSourceClaim,
   legacyMigrationSourceOrClaimMayExist,
   legacyMigrationSourceSnapshotsMatch as snapshotsMatch,
   readLegacyMigrationSourceSnapshot,
-  resolveLegacyMigrationRelativePath,
   type LegacyMigrationSourceSnapshot as LegacySourceSnapshot,
 } from "./state-migrations.source-snapshot.js";
 import type { MigrationMessages } from "./state-migrations.types.js";
+import { isPendingControlPlaneUpdateRestartSentinel } from "./update-control-plane-sentinel.js";
 
 const LEGACY_RESTART_SENTINEL_FILENAME = "restart-sentinel.json";
 const DOCTOR_CLAIM_SUFFIX = ".doctor-importing";
 const MAX_LEGACY_RESTART_SENTINEL_BYTES = 4 * 1024 * 1024;
-const MIGRATION_KIND = "legacy-restart-sentinel-json";
-const MIGRATION_LOCK_TIMEOUT_MS = 250;
-const MIGRATION_LOCK_POLL_INTERVAL_MS = 25;
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
-type RestartSentinelMigrationDatabase = Pick<
-  OpenClawStateKyselyDatabase,
-  "gateway_restart_sentinel" | "migration_runs" | "migration_sources"
->;
-
-type MigrationDecision =
-  | "canonical-preserved"
-  | "invalid-canonical-repaired"
-  | "legacy-imported"
-  | "malformed-legacy-discarded"
-  | "receipt-authoritative";
-
+export type RestartSentinelMigrationResult = MigrationMessages & {
+  importedRevision?: number;
+};
 /** Detect the exact retired file for startup preflight and explicit Doctor alike. */
 export function detectLegacyRestartSentinel(params: {
   stateDir: string;
@@ -62,24 +57,6 @@ export function detectLegacyRestartSentinel(params: {
   };
 }
 
-function relativeLegacyPath(stateDir: string, filePath: string): string {
-  return resolveLegacyMigrationRelativePath(stateDir, filePath, "restart sentinel", false);
-}
-
-async function readLegacySourceSnapshot(
-  stateRoot: Root,
-  stateDir: string,
-  sourcePath: string,
-): Promise<LegacySourceSnapshot> {
-  return readLegacyMigrationSourceSnapshot({
-    stateRoot,
-    stateDir,
-    sourcePath,
-    maxBytes: MAX_LEGACY_RESTART_SENTINEL_BYTES,
-    label: "restart sentinel",
-  });
-}
-
 function parseLegacyEnvelope(snapshot: LegacySourceSnapshot): RestartSentinelEnvelope | null {
   try {
     return parseRestartSentinelEnvelope(JSON.parse(utf8Decoder.decode(snapshot.buffer)));
@@ -88,52 +65,61 @@ function parseLegacyEnvelope(snapshot: LegacySourceSnapshot): RestartSentinelEnv
   }
 }
 
-function receiptSourceKey(sourcePath: string): string {
-  return `restart-sentinel-json:${createHash("sha256").update(path.resolve(sourcePath)).digest("hex")}`;
-}
-
-function hasMigrationReceipt(sourcePath: string, env: NodeJS.ProcessEnv): boolean {
-  const { db } = openOpenClawStateDatabase({ env });
-  return Boolean(
-    executeSqliteQueryTakeFirstSync(
-      db,
-      getNodeSqliteKysely<RestartSentinelMigrationDatabase>(db)
-        .selectFrom("migration_sources")
-        .select("source_key")
-        .where("source_key", "=", receiptSourceKey(sourcePath)),
-    ),
-  );
-}
-
 function decideAndRecordMigration(params: {
   env: NodeJS.ProcessEnv;
   sourcePath: string;
   snapshot: LegacySourceSnapshot;
   envelope: RestartSentinelEnvelope | null;
-}): { decision: MigrationDecision; sourceKey: string } {
-  const sourceKey = receiptSourceKey(params.sourcePath);
-  const runId = `${sourceKey}:${params.snapshot.sha256.slice(0, 16)}`;
+  assertCurrent?: () => void;
+  expectedRevision?: number | null;
+}): { decision: MigrationDecision; sourceKey: string; importedRevision?: number } {
+  const sourceKey = resolveLegacyMigrationSourceKey("restart-sentinel-json", params.sourcePath);
+  const runId = sourceRunId(sourceKey, params.snapshot.sha256);
   const now = Date.now();
+  params.assertCurrent?.();
   return runOpenClawStateWriteTransaction(
     ({ db }) => {
-      const stateDb = getNodeSqliteKysely<RestartSentinelMigrationDatabase>(db);
-      const receipt = executeSqliteQueryTakeFirstSync(
-        db,
-        stateDb
-          .selectFrom("migration_sources")
-          .select("source_key")
-          .where("source_key", "=", sourceKey),
-      );
-      const before = readRestartSentinelRowSync(db);
+      params.assertCurrent?.();
+      const receipt = readLegacyMigrationReceiptFromDatabase(db, sourceKey);
+      // A path is reused for each update; retain each exact source decision across A -> B -> A.
+      if (
+        readSourceDecision(db, sourceKey, params.snapshot.sha256) ||
+        (receipt && hasLegacyPathWideReceipt(receipt))
+      ) {
+        const decision: MigrationDecision = "receipt-authoritative";
+        return { decision, sourceKey };
+      }
+      if (receipt && !receipt.sourceSha256) {
+        throw new Error("restart sentinel receipt does not identify its source generation");
+      }
+      const { state: before, revision } = readRestartSentinelSnapshotSync(db);
+      const canonicalImport =
+        revision !== null
+          ? readCanonicalImport(db, sourceKey, receipt?.reportJson, revision)
+          : undefined;
       let decision: MigrationDecision;
-      if (receipt) {
-        decision = "receipt-authoritative";
+      let importedRevision: number | undefined;
+      const finalizesPending =
+        before.kind === "valid" &&
+        params.envelope &&
+        canFinalizeImportedUpdate(before.sentinel, params.envelope.payload, canonicalImport);
+      const handoffId = params.envelope?.payload.stats?.handoffId;
+      const consumedPending =
+        before.kind === "missing" &&
+        handoffId &&
+        hasImportedPendingHandoff(db, sourceKey, handoffId);
+      if (params.expectedRevision !== undefined && revision !== params.expectedRevision) {
+        throw new Error("Canonical restart state changed while the legacy notice was prepared.");
+      }
+      if (consumedPending) {
+        decision = "canonical-advanced";
       } else if (!params.envelope) {
         decision = "malformed-legacy-discarded";
-      } else if (before.kind === "valid") {
+      } else if (before.kind === "valid" && !finalizesPending) {
         decision = "canonical-preserved";
       } else {
         const written = writeRestartSentinelRowSync(db, params.envelope.payload);
+        importedRevision = written.revision;
         const verified = readRestartSentinelRowSync(db);
         if (
           verified.kind !== "valid" ||
@@ -142,7 +128,11 @@ function decideAndRecordMigration(params: {
         ) {
           throw new Error("SQLite verification failed for the restart sentinel migration");
         }
-        decision = before.kind === "invalid" ? "invalid-canonical-repaired" : "legacy-imported";
+        decision = finalizesPending
+          ? "legacy-update-finalized"
+          : before.kind === "invalid"
+            ? "invalid-canonical-repaired"
+            : "legacy-imported";
       }
 
       const reportJson = JSON.stringify({
@@ -151,149 +141,91 @@ function decideAndRecordMigration(params: {
         decision,
         sourceSha256: params.snapshot.sha256,
         sourceValid: params.envelope !== null,
-        importedRecordCount:
-          decision === "legacy-imported" || decision === "invalid-canonical-repaired" ? 1 : 0,
+        ...(importedRevision === undefined ? {} : { importedRevision }),
+        ...(importedRevision !== undefined &&
+        params.envelope &&
+        isPendingControlPlaneUpdateRestartSentinel(params.envelope.payload) &&
+        handoffId
+          ? { pendingHandoffId: handoffId }
+          : {}),
+        // Published path-wide receipts omitted this field; null records no generation pointer.
+        ...(importedRevision === undefined ? { canonicalImport: canonicalImport ?? null } : {}),
+        importedRecordCount: importedRevision === undefined ? 0 : 1,
         preservedSqliteRecordCount: decision === "canonical-preserved" ? 1 : 0,
       });
-      executeSqliteQuerySync(
-        db,
-        stateDb
-          .insertInto("migration_runs")
-          .values({
-            id: runId,
-            started_at: now,
-            finished_at: now,
-            status: "completed",
-            report_json: reportJson,
-          })
-          .onConflict((conflict) =>
-            conflict.column("id").doUpdateSet({
-              finished_at: now,
-              status: "completed",
-              report_json: reportJson,
-            }),
-          ),
-      );
-      executeSqliteQuerySync(
-        db,
-        stateDb
-          .insertInto("migration_sources")
-          .values({
-            source_key: sourceKey,
-            migration_kind: MIGRATION_KIND,
-            source_path: params.sourcePath,
-            target_table: "gateway_restart_sentinel",
-            source_sha256: params.snapshot.sha256,
-            source_size_bytes: params.snapshot.size,
-            source_record_count: params.envelope ? 1 : 0,
-            last_run_id: runId,
-            status: "completed",
-            imported_at: now,
-            removed_source: 0,
-            report_json: reportJson,
-          })
-          .onConflict((conflict) =>
-            conflict.column("source_key").doUpdateSet({
-              source_sha256: params.snapshot.sha256,
-              source_size_bytes: params.snapshot.size,
-              source_record_count: params.envelope ? 1 : 0,
-              last_run_id: runId,
-              status: "completed",
-              imported_at: now,
-              removed_source: 0,
-              report_json: reportJson,
-            }),
-          ),
-      );
-      return { decision, sourceKey };
+      recordLegacyMigrationReceipt(db, {
+        sourceKey,
+        migrationKind: MIGRATION_KIND,
+        sourcePath: params.sourcePath,
+        targetTable: "gateway_restart_sentinel",
+        sourceSha256: params.snapshot.sha256,
+        sourceSizeBytes: params.snapshot.size,
+        sourceRecordCount: params.envelope ? 1 : 0,
+        runId,
+        now,
+        reportJson,
+        upsert: true,
+      });
+      params.assertCurrent?.();
+      return { decision, sourceKey, importedRevision };
     },
     { env: params.env },
   );
 }
 
-function markSourceRemoved(sourceKey: string, env: NodeJS.ProcessEnv): void {
-  runOpenClawStateWriteTransaction(
-    ({ db }) => {
-      executeSqliteQuerySync(
-        db,
-        getNodeSqliteKysely<RestartSentinelMigrationDatabase>(db)
-          .updateTable("migration_sources")
-          .set({ removed_source: 1 })
-          .where("source_key", "=", sourceKey),
-      );
-    },
-    { env },
-  );
-}
-
-async function restoreClaim(params: {
-  stateRoot: Root;
-  stateDir: string;
-  sourcePath: string;
-}): Promise<string | null> {
-  const claimPath = `${params.sourcePath}${DOCTOR_CLAIM_SUFFIX}`;
-  try {
-    if (!(await params.stateRoot.exists(relativeLegacyPath(params.stateDir, claimPath)))) {
-      return null;
-    }
-    if (await params.stateRoot.exists(relativeLegacyPath(params.stateDir, params.sourcePath))) {
-      return `source path already exists: ${params.sourcePath}`;
-    }
-    await params.stateRoot.move(
-      relativeLegacyPath(params.stateDir, claimPath),
-      relativeLegacyPath(params.stateDir, params.sourcePath),
-    );
-    return null;
-  } catch (error) {
-    return String(error);
-  }
-}
-
 async function recoverInterruptedClaim(params: {
-  stateRoot: Root;
-  stateDir: string;
-  sourcePath: string;
+  source: LegacyMigrationSourceClaim;
   env: NodeJS.ProcessEnv;
+  assertCurrent?: () => void;
 }): Promise<void> {
-  const claimPath = `${params.sourcePath}${DOCTOR_CLAIM_SUFFIX}`;
-  const claimRelativePath = relativeLegacyPath(params.stateDir, claimPath);
-  if (!(await params.stateRoot.exists(claimRelativePath))) {
+  await params.source.recoverLinkedMove();
+  if (!(await params.source.exists(true))) {
     return;
   }
-  if (!(await params.stateRoot.exists(relativeLegacyPath(params.stateDir, params.sourcePath)))) {
-    await params.stateRoot.move(
-      claimRelativePath,
-      relativeLegacyPath(params.stateDir, params.sourcePath),
-    );
+  if (!(await params.source.exists())) {
+    const restoreError = await params.source.restore();
+    if (restoreError) {
+      throw new Error(restoreError);
+    }
     return;
   }
   // Both paths can only be retired safely when the claimed bytes already have
   // an authoritative decision; otherwise preserve both for operator recovery.
-  if (!hasMigrationReceipt(params.sourcePath, params.env)) {
+  const claimed = await params.source.read(true);
+  params.assertCurrent?.();
+  const decided = runOpenClawStateWriteTransaction(
+    ({ db }) => {
+      params.assertCurrent?.();
+      return readSourceDecision(
+        db,
+        resolveLegacyMigrationSourceKey("restart-sentinel-json", params.source.sourcePath),
+        claimed.sha256,
+      );
+    },
+    { env: params.env },
+  );
+  if (!decided) {
     throw new Error("legacy restart sentinel source and interrupted claim both exist");
   }
-  await readLegacySourceSnapshot(params.stateRoot, params.stateDir, claimPath);
-  await params.stateRoot.remove(claimRelativePath);
+  params.assertCurrent?.();
+  await params.source.remove({ skipSourceCheck: true });
 }
 
-function decisionChange(decision: MigrationDecision): string {
-  switch (decision) {
-    case "legacy-imported":
-      return "Imported the legacy restart sentinel into shared SQLite state.";
-    case "invalid-canonical-repaired":
-      return "Replaced an invalid SQLite restart sentinel with validated legacy state.";
-    case "canonical-preserved":
-      return "Preserved the canonical SQLite restart sentinel and discarded conflicting legacy JSON.";
-    case "malformed-legacy-discarded":
-      return "Discarded malformed retired restart sentinel JSON without importing it.";
-    case "receipt-authoritative":
-      return "Discarded recreated retired restart sentinel JSON using its migration receipt.";
-  }
-  const unreachable: never = decision;
-  return unreachable;
-}
+const DECISION_CHANGES: Record<MigrationDecision, string> = {
+  "legacy-imported": "Imported the legacy restart sentinel into shared SQLite state.",
+  "legacy-update-finalized": "Imported the final outcome of the pending legacy update.",
+  "canonical-advanced": "Preserved newer canonical restart state instead of replaying legacy JSON.",
+  "invalid-canonical-repaired":
+    "Replaced an invalid SQLite restart sentinel with validated legacy state.",
+  "canonical-preserved":
+    "Preserved the canonical SQLite restart sentinel and discarded conflicting legacy JSON.",
+  "malformed-legacy-discarded":
+    "Discarded malformed retired restart sentinel JSON without importing it.",
+  "receipt-authoritative":
+    "Discarded recreated retired restart sentinel JSON using its migration receipt.",
+};
 
-async function migrateWithExclusiveStateOwnership(params: {
+export async function migrateLegacyRestartSentinelWithCustody(params: {
   detected: LegacyRestartSentinelDetection;
   stateRoot: Root;
   stateDir: string;
@@ -301,17 +233,35 @@ async function migrateWithExclusiveStateOwnership(params: {
   beforeClaim?: () => void;
   beforeVerify?: () => void;
   removeSource?: (sourcePath: string) => Promise<void> | void;
-}): Promise<MigrationMessages> {
+  assertCurrent?: () => void;
+  expectedRevision?: number | null;
+  updatesOnly?: boolean;
+}): Promise<RestartSentinelMigrationResult> {
   const changes: string[] = [];
   const warnings: string[] = [];
   const notices: string[] = [];
   const sourcePath = params.detected.sourcePath;
+  const source = new LegacyMigrationSourceClaim<LegacySourceSnapshot>({
+    stateRoot: params.stateRoot,
+    stateDir: params.stateDir,
+    sourcePath,
+    label: "restart sentinel",
+    includeFilePath: false,
+    claimSuffix: DOCTOR_CLAIM_SUFFIX,
+    readSnapshot: (snapshotPath) =>
+      readLegacyMigrationSourceSnapshot({
+        stateRoot: params.stateRoot,
+        stateDir: params.stateDir,
+        sourcePath: snapshotPath,
+        maxBytes: MAX_LEGACY_RESTART_SENTINEL_BYTES,
+        label: "restart sentinel",
+      }),
+  });
   try {
     await recoverInterruptedClaim({
-      stateRoot: params.stateRoot,
-      stateDir: params.stateDir,
-      sourcePath,
+      source,
       env: params.env,
+      assertCurrent: params.assertCurrent,
     });
   } catch (error) {
     return {
@@ -319,13 +269,13 @@ async function migrateWithExclusiveStateOwnership(params: {
       warnings: [`Failed recovering a legacy restart sentinel Doctor claim: ${String(error)}`],
     };
   }
-  if (!(await params.stateRoot.exists(relativeLegacyPath(params.stateDir, sourcePath)))) {
+  if (!(await source.exists())) {
     return { changes, warnings };
   }
 
   let snapshot: LegacySourceSnapshot;
   try {
-    snapshot = await readLegacySourceSnapshot(params.stateRoot, params.stateDir, sourcePath);
+    snapshot = await source.read();
   } catch (error) {
     return {
       changes,
@@ -333,28 +283,31 @@ async function migrateWithExclusiveStateOwnership(params: {
     };
   }
   const envelope = parseLegacyEnvelope(snapshot);
-  const claimPath = `${sourcePath}${DOCTOR_CLAIM_SUFFIX}`;
+  if (params.updatesOnly && envelope?.payload.kind !== "update") {
+    return {
+      changes,
+      warnings: envelope
+        ? []
+        : ["Legacy update notice is incomplete or invalid; its source was preserved."],
+    };
+  }
   try {
+    params.assertCurrent?.();
     params.beforeVerify?.();
-    const current = await readLegacySourceSnapshot(params.stateRoot, params.stateDir, sourcePath);
+    const current = await source.read();
     if (!snapshotsMatch(current, snapshot)) {
       throw new Error("legacy restart sentinel changed after migration loaded it");
     }
-    params.beforeClaim?.();
-    await params.stateRoot.move(
-      relativeLegacyPath(params.stateDir, sourcePath),
-      relativeLegacyPath(params.stateDir, claimPath),
-    );
-    const claimed = await readLegacySourceSnapshot(params.stateRoot, params.stateDir, claimPath);
-    if (!snapshotsMatch(claimed, snapshot)) {
-      throw new Error("legacy restart sentinel changed before migration could claim it");
-    }
-  } catch (error) {
-    const restoreError = await restoreClaim({
-      stateRoot: params.stateRoot,
-      stateDir: params.stateDir,
-      sourcePath,
+    await source.claim({
+      snapshot,
+      mismatchMessage: "legacy restart sentinel changed before migration could claim it",
+      beforeClaim: () => {
+        params.assertCurrent?.();
+        params.beforeClaim?.();
+      },
     });
+  } catch (error) {
+    const restoreError = await source.restore();
     return {
       changes,
       warnings: [
@@ -370,13 +323,11 @@ async function migrateWithExclusiveStateOwnership(params: {
       sourcePath,
       snapshot,
       envelope,
+      assertCurrent: params.assertCurrent,
+      expectedRevision: params.expectedRevision,
     });
   } catch (error) {
-    const restoreError = await restoreClaim({
-      stateRoot: params.stateRoot,
-      stateDir: params.stateDir,
-      sourcePath,
-    });
+    const restoreError = await source.restore();
     return {
       changes,
       warnings: [
@@ -386,35 +337,28 @@ async function migrateWithExclusiveStateOwnership(params: {
   }
 
   try {
-    if (await params.stateRoot.exists(relativeLegacyPath(params.stateDir, sourcePath))) {
-      throw new Error("legacy restart sentinel reappeared during migration cleanup");
-    }
-    if (params.removeSource) {
-      await params.removeSource(claimPath);
-    } else {
-      await params.stateRoot.remove(relativeLegacyPath(params.stateDir, claimPath));
-    }
-    if (
-      (await params.stateRoot.exists(relativeLegacyPath(params.stateDir, sourcePath))) ||
-      (await params.stateRoot.exists(relativeLegacyPath(params.stateDir, claimPath)))
-    ) {
-      throw new Error("legacy restart sentinel remains after migration cleanup");
-    }
+    params.assertCurrent?.();
+    await source.remove({
+      removeSource: params.removeSource,
+      sourceReappearedMessage: "legacy restart sentinel reappeared during migration cleanup",
+      remainingMessage: "legacy restart sentinel remains after migration cleanup",
+    });
   } catch (error) {
     warnings.push(`Legacy restart sentinel cleanup failed: ${String(error)}`);
-    return { changes, warnings };
+    return { changes, warnings, importedRevision: result.importedRevision };
   }
 
   try {
-    markSourceRemoved(result.sourceKey, params.env);
+    params.assertCurrent?.();
+    markLegacyMigrationSourceRemoved(result.sourceKey, params.env, undefined, params.assertCurrent);
   } catch (error) {
     warnings.push(
       `Legacy restart sentinel was removed, but its receipt could not be finalized: ${String(error)}`,
     );
   }
-  changes.push(decisionChange(result.decision));
+  changes.push(DECISION_CHANGES[result.decision]);
   notices.push("Removed retired restart-sentinel.json after recording its migration decision.");
-  return { changes, warnings, notices };
+  return { changes, warnings, notices, importedRevision: result.importedRevision };
 }
 
 /** Import or retire the old file under exclusive state ownership. */
@@ -430,66 +374,25 @@ export async function migrateLegacyRestartSentinel(params: {
   if (!detected?.hasLegacy) {
     return { changes: [], warnings: [] };
   }
-  const env = { ...(params.env ?? process.env), OPENCLAW_STATE_DIR: params.stateDir };
-  let lock: Awaited<ReturnType<typeof acquireGatewayLock>>;
-  try {
-    lock = await acquireGatewayLock({
-      allowInTests: true,
-      env,
-      pollIntervalMs: MIGRATION_LOCK_POLL_INTERVAL_MS,
-      role: "sqlite-maintenance",
-      timeoutMs: MIGRATION_LOCK_TIMEOUT_MS,
-    });
-  } catch (error) {
-    const detail =
-      error instanceof GatewayLockError
-        ? "the Gateway or another SQLite maintenance command owns this state directory"
-        : String(error);
-    return {
-      changes: [],
-      warnings: [
-        `Failed migrating the legacy restart sentinel: ${detail}. Stop the Gateway, then run \`openclaw doctor --fix\` again.`,
-      ],
-    };
-  }
-  if (!lock) {
-    return {
-      changes: [],
-      warnings: [
-        "Failed migrating the legacy restart sentinel: exclusive state ownership unavailable.",
-      ],
-    };
-  }
-
-  let result: MigrationMessages = { changes: [], warnings: [] };
-  let releaseError: unknown;
-  try {
-    try {
+  return await withLegacyMigrationStateLock({
+    stateDir: params.stateDir,
+    env: params.env,
+    label: "the legacy restart sentinel",
+    releaseLabel: "Restart sentinel",
+    errorLabel: "Failed reading the legacy restart sentinel",
+    retryGuidance: "Stop the Gateway, then run `openclaw doctor --fix` again.",
+    run: async (env) => {
       const stateRoot = await root(params.stateDir, {
         hardlinks: "reject",
         maxBytes: MAX_LEGACY_RESTART_SENTINEL_BYTES,
         symlinks: "reject",
       });
-      result = await migrateWithExclusiveStateOwnership({
+      return await migrateLegacyRestartSentinelWithCustody({
         ...params,
         detected,
         env,
         stateRoot,
       });
-    } catch (error) {
-      result.warnings.push(`Failed reading the legacy restart sentinel: ${String(error)}`);
-    }
-  } finally {
-    try {
-      await lock.release();
-    } catch (error) {
-      releaseError = error;
-    }
-  }
-  if (releaseError) {
-    result.warnings.push(
-      `Restart sentinel migration lock release failed: ${formatErrorMessage(releaseError)}`,
-    );
-  }
-  return result;
+    },
+  });
 }

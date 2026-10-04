@@ -6,22 +6,18 @@ import { expectDefined } from "@openclaw/normalization-core";
  * debounce drains, and force individual collection when cross-channel ordering matters.
  */
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
+import type { QueueDropPolicy } from "../config/types.queue.js";
 import { isFastTestRuntimeEnv } from "../infra/env.js";
 
-/** Mutable summary state for a capped queue. */
 type QueueSummaryState = {
-  dropPolicy: "summarize" | "old" | "new";
   droppedCount: number;
   summaryLines: string[];
 };
 
-/** Queue overflow strategy. */
-type QueueDropPolicy = QueueSummaryState["dropPolicy"];
-
-/** Generic capped queue state with shared overflow summary fields. */
 type QueueState<T> = QueueSummaryState & {
   items: T[];
   cap: number;
+  dropPolicy: QueueDropPolicy;
 };
 
 /** Build a summary prompt preview without mutating the source queue state. */
@@ -30,11 +26,20 @@ export function previewQueueSummaryPrompt(params: {
   noun: string;
   title?: string;
 }): string | undefined {
-  return buildQueueSummaryPrompt({
-    state: params.state,
-    noun: params.noun,
-    title: params.title,
-  });
+  if (params.state.droppedCount <= 0) {
+    return undefined;
+  }
+  const title =
+    params.title ??
+    `[Queue overflow] Dropped ${params.state.droppedCount} ${params.noun}${params.state.droppedCount === 1 ? "" : "s"} due to cap.`;
+  const lines = [title];
+  if (params.state.summaryLines.length > 0) {
+    lines.push("Summary:");
+    for (const line of params.state.summaryLines) {
+      lines.push(`- ${line}`);
+    }
+  }
+  return lines.join("\n");
 }
 
 /** Apply runtime queue settings while preserving previous values for omitted fields. */
@@ -64,30 +69,9 @@ export function applyQueueRuntimeSettings<TMode extends string>(params: {
   params.target.dropPolicy = params.settings.dropPolicy ?? params.target.dropPolicy;
 }
 
-/** Trim queue summary text to a bounded single-line preview. */
-function elideQueueText(text: string, limit = 140): string {
-  if (text.length <= limit) {
-    return text;
-  }
-  return `${truncateUtf16Safe(text, Math.max(0, limit - 1)).trimEnd()}…`;
-}
-
-/** Normalize whitespace and elide one dropped item for queue summaries. */
-function buildQueueSummaryLine(text: string, limit = 160): string {
+function buildQueueSummaryLine(text: string): string {
   const cleaned = text.replace(/\s+/g, " ").trim();
-  return elideQueueText(cleaned, limit);
-}
-
-/** Run optional duplicate detection before an item enters a queue. */
-export function shouldSkipQueueItem<T>(params: {
-  item: T;
-  items: T[];
-  dedupe?: (item: T, items: T[]) => boolean;
-}): boolean {
-  if (!params.dedupe) {
-    return false;
-  }
-  return params.dedupe(params.item, params.items);
+  return cleaned.length <= 160 ? cleaned : `${truncateUtf16Safe(cleaned, 159).trimEnd()}…`;
 }
 
 /** Count identities that are still pending in the queue, excluding active deliveries. */
@@ -110,6 +94,7 @@ export function applyQueueDropPolicy<T>(params: {
   summarize: (item: T) => string;
   summaryLimit?: number;
   onDrop?: (items: T[]) => void;
+  onSummaryElide?: (lines: string[]) => void;
   inFlight?: ReadonlySet<T>;
   isProtected?: (item: T) => boolean;
 }): boolean {
@@ -153,8 +138,11 @@ export function applyQueueDropPolicy<T>(params: {
     }
     // Summary memory is bounded independently from the item cap to avoid prompt blowups.
     const limit = Math.max(0, params.summaryLimit ?? cap);
-    while (params.queue.summaryLines.length > limit) {
-      params.queue.summaryLines.shift();
+    const summaryLines = params.queue.summaryLines;
+    if (summaryLines.length > limit) {
+      // Round the cutoff first; subtraction can erase a fraction just below an integer.
+      const elidedLines = summaryLines.splice(0, summaryLines.length - Math.floor(limit));
+      params.onSummaryElide?.(elidedLines);
     }
   }
   return true;
@@ -180,13 +168,10 @@ export function waitForQueueDebounce(
     return Promise.resolve();
   }
   return new Promise<void>((resolve) => {
-    let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let observedEnqueuedAt: number | undefined;
+    let observedAtMs = 0;
     const finish = () => {
-      if (settled) {
-        return;
-      }
-      settled = true;
       if (timer !== undefined) {
         clearTimeout(timer);
       }
@@ -198,7 +183,14 @@ export function waitForQueueDebounce(
         finish();
         return;
       }
-      const since = Date.now() - queue.lastEnqueuedAt;
+      const nowMs = performance.now();
+      if (queue.lastEnqueuedAt !== observedEnqueuedAt) {
+        observedEnqueuedAt = queue.lastEnqueuedAt;
+        observedAtMs = nowMs;
+      }
+      // Wall time counts quiet time before this wait; elapsed time keeps a
+      // backward wall-clock step from extending the window until wall time catches up.
+      const since = Math.max(Date.now() - queue.lastEnqueuedAt, nowMs - observedAtMs);
       if (since >= debounceMs) {
         finish();
         return;
@@ -261,26 +253,6 @@ export async function drainNextQueueItem<T>(
   return true;
 }
 
-/** Drain one item when collect mode requires individual processing. */
-async function drainCollectItemIfNeeded<T>(params: {
-  forceIndividualCollect: boolean;
-  isCrossChannel: boolean;
-  setForceIndividualCollect?: (next: boolean) => void;
-  items: T[];
-  run: (item: T) => Promise<void>;
-  reserveOptions?: DrainQueueItemOptions<T>;
-}): Promise<"skipped" | "drained" | "empty"> {
-  if (!params.forceIndividualCollect && !params.isCrossChannel) {
-    return "skipped";
-  }
-  if (params.isCrossChannel) {
-    // Once cross-channel items appear, future collection stays individual to preserve ordering.
-    params.setForceIndividualCollect?.(true);
-  }
-  const drained = await drainNextQueueItem(params.items, params.run, params.reserveOptions);
-  return drained ? "drained" : "empty";
-}
-
 /** Drain one collect step using mutable queue collection state. */
 export async function drainCollectQueueStep<T>(params: {
   collectState: { forceIndividualCollect: boolean };
@@ -289,39 +261,15 @@ export async function drainCollectQueueStep<T>(params: {
   run: (item: T) => Promise<void>;
   reserveOptions?: DrainQueueItemOptions<T>;
 }): Promise<"skipped" | "drained" | "empty"> {
-  return await drainCollectItemIfNeeded({
-    forceIndividualCollect: params.collectState.forceIndividualCollect,
-    isCrossChannel: params.isCrossChannel,
-    setForceIndividualCollect: (next) => {
-      params.collectState.forceIndividualCollect = next;
-    },
-    items: params.items,
-    run: params.run,
-    reserveOptions: params.reserveOptions,
-  });
-}
-
-/** Build the queue overflow summary prompt. */
-function buildQueueSummaryPrompt(params: {
-  state: QueueSummaryState;
-  noun: string;
-  title?: string;
-}): string | undefined {
-  if (params.state.dropPolicy !== "summarize" || params.state.droppedCount <= 0) {
-    return undefined;
+  if (!params.collectState.forceIndividualCollect && !params.isCrossChannel) {
+    return "skipped";
   }
-  const noun = params.noun;
-  const title =
-    params.title ??
-    `[Queue overflow] Dropped ${params.state.droppedCount} ${noun}${params.state.droppedCount === 1 ? "" : "s"} due to cap.`;
-  const lines = [title];
-  if (params.state.summaryLines.length > 0) {
-    lines.push("Summary:");
-    for (const line of params.state.summaryLines) {
-      lines.push(`- ${line}`);
-    }
+  if (params.isCrossChannel) {
+    // Once cross-channel items appear, future collection stays individual to preserve ordering.
+    params.collectState.forceIndividualCollect = true;
   }
-  return lines.join("\n");
+  const drained = await drainNextQueueItem(params.items, params.run, params.reserveOptions);
+  return drained ? "drained" : "empty";
 }
 
 /** Render a collect prompt from queued items and optional overflow summary. */
@@ -346,18 +294,15 @@ export function hasCrossChannelItems<T>(
   items: T[],
   resolveKey: (item: T) => { key?: string; cross?: boolean },
 ): boolean {
-  const keys = new Set<string>();
+  let firstKey: string | undefined;
 
   for (const item of items) {
     const resolved = resolveKey(item);
-    if (resolved.cross) {
+    if (resolved.cross || (resolved.key && firstKey && resolved.key !== firstKey)) {
       return true;
     }
-    if (!resolved.key) {
-      continue;
-    }
-    keys.add(resolved.key);
+    firstKey ||= resolved.key;
   }
 
-  return keys.size > 1;
+  return false;
 }

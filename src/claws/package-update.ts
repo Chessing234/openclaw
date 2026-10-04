@@ -1,19 +1,21 @@
-import { createHash } from "node:crypto";
-import { stableStringify } from "../agents/stable-stringify.js";
+import { coerceErrorMessage } from "@openclaw/normalization-core";
 import { preflightPluginInstall } from "../plugins/plugin-install-preflight.js";
-import type { OpenClawStateDatabaseOptions } from "../state/openclaw-state-db.js";
+import { clawPackageKey } from "./application-provenance.js";
+import { digestClawValue as digest } from "./digest.js";
 import {
   digestClawPackageRef,
   replaceClawPackageRefExpected,
 } from "./package-update-provenance.js";
 import { installClawPackages } from "./packages.js";
+import type { ClawPluginRuntimeOptions } from "./plugin-runtime.js";
 import {
   CLAW_PACKAGE_REF_SCHEMA_VERSION,
   readClawPackageRefs,
   type PersistedClawPackageRef,
 } from "./provenance.js";
-import type { ClawAddPlan, ClawManifest, ClawPackage } from "./types.js";
+import type { ClawAddPlan, ClawPackage } from "./types.js";
 import type { ClawUpdatePlan } from "./update-plan.js";
+import { collectClawRollbackFailures } from "./update-rollback.js";
 
 type PackageInstallerDeps = NonNullable<
   NonNullable<Parameters<typeof installClawPackages>[1]>["deps"]
@@ -28,25 +30,17 @@ export class ClawPackageUpdateError extends Error {
   constructor(
     message: string,
     readonly partial: boolean,
+    options?: ErrorOptions,
   ) {
-    super(message);
+    super(message, options);
     this.name = "ClawPackageUpdateError";
   }
 }
 
-function digest(value: unknown): string {
-  return `sha256:${createHash("sha256").update(stableStringify(value)).digest("hex")}`;
-}
-
-function packageKey(value: Pick<ClawPackage, "kind" | "ref">): string {
-  return `${value.kind}:${value.ref}`;
-}
-
 export async function applyClawPackageUpdate(
   updatePlan: ClawUpdatePlan,
-  targetManifest: ClawManifest,
   targetAddPlan: ClawAddPlan,
-  options: OpenClawStateDatabaseOptions & {
+  options: ClawPluginRuntimeOptions & {
     installPackages?: typeof installClawPackages;
     readRefs?: typeof readClawPackageRefs;
     replaceExpected?: typeof replaceClawPackageRefExpected;
@@ -64,23 +58,15 @@ export async function applyClawPackageUpdate(
   const readRefs = options.readRefs ?? readClawPackageRefs;
   const replaceExpected = options.replaceExpected ?? replaceClawPackageRefExpected;
   const currentRefs = new Map(
-    readRefs({ ...options, agentId: updatePlan.agentId }).map((ref) => [packageKey(ref), ref]),
+    readRefs({ ...options, agentId: updatePlan.agentId }).map((ref) => [clawPackageKey(ref), ref]),
   );
   const allRefs = readRefs(options);
-  const targets = new Map(targetManifest.packages.map((pkg) => [packageKey(pkg), pkg]));
   const undo: Array<() => Promise<void>> = [];
   const externalMutations: string[] = [];
   const appliedIds: string[] = [];
 
   const rollback = async () => {
-    const failures: string[] = [];
-    for (const revert of undo.toReversed()) {
-      try {
-        await revert();
-      } catch (error) {
-        failures.push(error instanceof Error ? error.message : String(error));
-      }
-    }
+    const failures = await collectClawRollbackFailures(undo.toReversed());
     if (externalMutations.length > 0) {
       failures.push(`package artifacts may have been retained: ${externalMutations.join(", ")}`);
     }
@@ -114,17 +100,29 @@ export async function applyClawPackageUpdate(
         appliedIds.push(action.id);
         continue;
       }
-      const target = targets.get(action.id);
       const targetAction = targetAddPlan.actions.find(
         (candidate) => candidate.kind === "package" && candidate.id === action.id,
       );
-      if (!target || !targetAction) {
+      const target = targetAction?.details as
+        | (ClawPackage & {
+            integrity?: string;
+            ownerAction?: "install" | "reuse";
+            extension?: PersistedClawPackageRef["extension"];
+          })
+        | undefined;
+      if (
+        !targetAction ||
+        (target?.kind !== "skill" && target?.kind !== "plugin") ||
+        target.source !== "clawhub" ||
+        !target.ref ||
+        !target.version
+      ) {
         throw new ClawPackageUpdateError(
           `Target package action ${JSON.stringify(action.id)} is missing.`,
           false,
         );
       }
-      const targetIntegrity = targetAction.details?.integrity;
+      const targetIntegrity = target.integrity;
       if (typeof targetIntegrity !== "string") {
         throw new ClawPackageUpdateError(
           `Target package action ${JSON.stringify(action.id)} has no resolved integrity.`,
@@ -148,7 +146,11 @@ export async function applyClawPackageUpdate(
         );
       }
       const nowMs = options.nowMs ?? Date.now();
-      const reusesExistingArtifact = targetAction.details?.ownerAction === "reuse";
+      const reusesExistingArtifact = target.ownerAction === "reuse";
+      const preservesExistingEdge =
+        reusesExistingArtifact &&
+        previous?.version === target.version &&
+        previous.integrity === targetIntegrity;
       let claimed: PersistedClawPackageRef = {
         schemaVersion: CLAW_PACKAGE_REF_SCHEMA_VERSION,
         agentId: updatePlan.agentId,
@@ -159,10 +161,22 @@ export async function applyClawPackageUpdate(
         version: target.version,
         integrity: targetIntegrity,
         status: "pending",
-        relationship: target.kind === "skill" ? "managed" : "referenced",
-        origin: reusesExistingArtifact ? "pre-existing" : "claw-introduced",
-        independentOwner: reusesExistingArtifact,
-        installedAtMs: nowMs,
+        relationship:
+          preservesExistingEdge && previous
+            ? previous.relationship
+            : target.kind === "skill"
+              ? "managed"
+              : "referenced",
+        origin:
+          preservesExistingEdge && previous
+            ? previous.origin
+            : reusesExistingArtifact
+              ? "pre-existing"
+              : "claw-introduced",
+        independentOwner:
+          preservesExistingEdge && previous ? previous.independentOwner : reusesExistingArtifact,
+        ...(target.extension ? { extension: target.extension } : {}),
+        installedAtMs: preservesExistingEdge && previous ? previous.installedAtMs : nowMs,
         updatedAtMs: nowMs,
       };
       replaceExpected(previous, claimed, options);
@@ -171,6 +185,7 @@ export async function applyClawPackageUpdate(
         { ...targetAddPlan, actions: [targetAction] },
         {
           ...options,
+          pluginInstallMode: action.action === "change" ? "update" : "install",
           deps: {
             ...options.packageDeps,
             preflightPlugin: async (params) => {
@@ -199,9 +214,15 @@ export async function applyClawPackageUpdate(
               const next = {
                 ...claimed,
                 status: persistOptions?.status ?? "complete",
-                relationship: persistOptions?.relationship ?? claimed.relationship,
-                origin: persistOptions?.origin ?? claimed.origin,
-                independentOwner: persistOptions?.independentOwner ?? claimed.independentOwner,
+                relationship: preservesExistingEdge
+                  ? claimed.relationship
+                  : (persistOptions?.relationship ?? claimed.relationship),
+                origin: preservesExistingEdge
+                  ? claimed.origin
+                  : (persistOptions?.origin ?? claimed.origin),
+                independentOwner: preservesExistingEdge
+                  ? claimed.independentOwner
+                  : (persistOptions?.independentOwner ?? claimed.independentOwner),
                 updatedAtMs: nowMs,
               };
               replaceExpected(claimed, next, options);
@@ -221,7 +242,7 @@ export async function applyClawPackageUpdate(
         },
       );
       const installed = refs.find(
-        (ref) => packageKey(ref) === action.id && ref.version === target.version,
+        (ref) => clawPackageKey(ref) === action.id && ref.version === target.version,
       );
       if (!installed) {
         throw new ClawPackageUpdateError(
@@ -238,21 +259,24 @@ export async function applyClawPackageUpdate(
   } catch (error) {
     if (externalMutations.length > 0) {
       throw new ClawPackageUpdateError(
-        `${error instanceof Error ? error.message : String(error)}; package artifact outcome requires reconciliation`,
+        `${coerceErrorMessage(error)}; package artifact outcome requires reconciliation`,
         true,
+        { cause: error },
       );
     }
     try {
       await rollback();
     } catch (rollbackError) {
       throw new ClawPackageUpdateError(
-        `${error instanceof Error ? error.message : String(error)}; rollback incomplete: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+        `${coerceErrorMessage(error)}; rollback incomplete: ${coerceErrorMessage(rollbackError)}`,
         externalMutations.length > 0,
+        { cause: new AggregateError([error, rollbackError]) },
       );
     }
     throw new ClawPackageUpdateError(
-      error instanceof Error ? error.message : String(error),
+      coerceErrorMessage(error),
       error instanceof ClawPackageUpdateError ? error.partial : false,
+      { cause: error },
     );
   }
   return { appliedIds, rollback };

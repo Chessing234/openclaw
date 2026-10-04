@@ -1,10 +1,13 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import {
   countSessionToolOverrides,
   nextBooleanToolOverrides,
+  nextMcpToolsDenyOverrides,
   nextWebSearchToolOverrides,
+  readOwnEntry,
   resolveToolOverrideState,
-  sessionToolOverrideNames,
+  resolveWebSearchToolOverrideState,
 } from "./tool-overrides.ts";
 
 describe("session tool overrides", () => {
@@ -13,6 +16,20 @@ describe("session tool overrides", () => {
     expect(resolveToolOverrideState(false, undefined)).toBe(false);
     expect(resolveToolOverrideState(true, false)).toBe(false);
     expect(resolveToolOverrideState(false, true)).toBe(true);
+  });
+
+  it("treats global web-search disable as a kill switch for effective state", () => {
+    expect(resolveWebSearchToolOverrideState(true, undefined)).toBe(true);
+    expect(resolveWebSearchToolOverrideState(true, true)).toBe(true);
+    expect(resolveWebSearchToolOverrideState(true, false)).toBe(false);
+    expect(resolveWebSearchToolOverrideState(false, undefined)).toBe(false);
+    expect(resolveWebSearchToolOverrideState(false, false)).toBe(false);
+    expect(resolveWebSearchToolOverrideState(false, true)).toBe(false);
+  });
+
+  it("reads only own dynamic-key entries", () => {
+    expect(readOwnEntry({ github: false }, "constructor")).toBeUndefined();
+    expect(readOwnEntry({ constructor: false }, "constructor")).toBe(false);
   });
 
   it("adds and removes named overrides without disturbing sibling groups", () => {
@@ -40,11 +57,87 @@ describe("session tool overrides", () => {
     const off = nextWebSearchToolOverrides({ skills: { docs: true } }, false);
     expect(off).toEqual({ skills: { docs: true }, webSearch: false });
     expect(nextWebSearchToolOverrides(off, true)).toEqual({ skills: { docs: true } });
-    expect(nextWebSearchToolOverrides({}, true, false)).toEqual({ webSearch: true });
-    expect(nextWebSearchToolOverrides({ webSearch: true }, false, false)).toEqual({});
   });
 
-  it("counts override categories and returns deterministic tooltip names", () => {
+  it.each([
+    { name: "absent", current: {}, expected: {} },
+    { name: "explicit false", current: { webSearch: false }, expected: { webSearch: false } },
+    { name: "stale true", current: { webSearch: true }, expected: {} },
+  ])(
+    "preserves $name intent and sibling overrides while global web search is off",
+    ({ current, expected }) => {
+      const siblings = {
+        skills: { docs: true },
+        mcpServers: { github: false },
+        mcpToolsDeny: { notion: ["delete_page"] },
+      };
+      const overrides = { ...siblings, ...current };
+      const original = structuredClone(overrides);
+      for (const nextEnabled of [false, true]) {
+        expect(nextWebSearchToolOverrides(current, nextEnabled, false)).toEqual(expected);
+        expect(nextWebSearchToolOverrides(overrides, nextEnabled, false)).toEqual({
+          ...siblings,
+          ...expected,
+        });
+        expect(overrides).toEqual(original);
+      }
+    },
+  );
+
+  it("adds sorted MCP tool denials without mutating sibling overrides", () => {
+    const current = {
+      mcpToolsDeny: { github: ["zebra"], notion: ["delete_page"] },
+      webSearch: false,
+    };
+    expect(nextMcpToolsDenyOverrides(current, "github", "alpha", true)).toEqual({
+      mcpToolsDeny: { github: ["alpha", "zebra"], notion: ["delete_page"] },
+      webSearch: false,
+    });
+    expect(current.mcpToolsDeny.github).toEqual(["zebra"]);
+  });
+
+  it("removes MCP tool denials and keeps the map sparse", () => {
+    expect(
+      nextMcpToolsDenyOverrides(
+        { mcpToolsDeny: { github: ["read", "write"], notion: ["delete_page"] } },
+        "github",
+        "read",
+        false,
+      ),
+    ).toEqual({ mcpToolsDeny: { github: ["write"], notion: ["delete_page"] } });
+    expect(
+      nextMcpToolsDenyOverrides(
+        { mcpToolsDeny: { github: ["write"], notion: ["delete_page"] } },
+        "github",
+        "write",
+        false,
+      ),
+    ).toEqual({ mcpToolsDeny: { notion: ["delete_page"] } });
+    expect(
+      nextMcpToolsDenyOverrides({ mcpToolsDeny: { github: ["write"] } }, "github", "write", false),
+    ).toEqual({});
+  });
+
+  it("treats constructor as an own MCP server key", () => {
+    expect(
+      nextMcpToolsDenyOverrides(
+        { mcpToolsDeny: { github: ["read"] } },
+        "constructor",
+        "inspect",
+        true,
+      ),
+    ).toEqual({
+      mcpToolsDeny: { constructor: ["inspect"], github: ["read"] },
+    });
+  });
+
+  it.each(["mcpServers", "skills"] as const)("treats hasOwnProperty as an own %s key", (group) => {
+    expect(nextBooleanToolOverrides({}, group, "hasOwnProperty", false, true)).toEqual({
+      [group]: { hasOwnProperty: false },
+    });
+  });
+
+  it("counts override categories", () => {
     const overrides = {
       mcpServers: { zeta: false, alpha: true },
       mcpToolsDeny: { tools: ["danger"] },
@@ -52,12 +145,5 @@ describe("session tool overrides", () => {
       webSearch: false,
     };
     expect(countSessionToolOverrides(overrides)).toBe(5);
-    expect(sessionToolOverrideNames(overrides, "Web search")).toEqual([
-      "alpha",
-      "beta",
-      "tools",
-      "Web search",
-      "zeta",
-    ]);
   });
 });

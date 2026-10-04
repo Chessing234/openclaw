@@ -74,14 +74,11 @@ enum ApplicationRelocator {
         }
     }
 
-    struct ReplacementHandoffPolicy: Equatable, Sendable {
-        let maximumAttempts: Int
-        let initialBackoffSeconds: Int
-        let maximumBackoffSeconds: Int
-        let baseTimeoutMilliseconds: Int32
-        let maximumTimeoutMilliseconds: Int32
+    enum ReplacementHandoffPolicy {
+        static let maximumAttempts = 3
+        private static let baseTimeoutMilliseconds: Int32 = 15000
 
-        func failureAction(
+        static func failureAction(
             failedAttempt: Int,
             hasKeepAliveSupervisor: Bool) -> ReplacementHandoffFailureAction
         {
@@ -89,13 +86,11 @@ enum ApplicationRelocator {
                 return hasKeepAliveSupervisor ? .terminateForSupervisor : .stopMonitoring
             }
             let exponent = max(0, failedAttempt - 1)
-            let backoff = min(
-                self.maximumBackoffSeconds,
-                self.initialBackoffSeconds * (1 << exponent))
+            let backoff = min(8, 2 * (1 << exponent))
             return .retry(after: .seconds(backoff))
         }
 
-        func timeoutMilliseconds(
+        static func timeoutMilliseconds(
             loadAverage: Double?,
             activeProcessorCount: Int) -> Int32
         {
@@ -108,13 +103,8 @@ enum ApplicationRelocator {
             let multiplier = min(4, max(1, loadPerProcessor))
             let scaled = Double(self.baseTimeoutMilliseconds) * multiplier
             let rounded = ceil(scaled / 5000) * 5000
-            return min(self.maximumTimeoutMilliseconds, Int32(rounded))
+            return min(60000, Int32(rounded))
         }
-    }
-
-    enum RelaunchStrategy: Equatable, Sendable {
-        case openAfterTermination
-        case externalSupervisor
     }
 
     struct BundleFileReference: Equatable, Sendable {
@@ -133,7 +123,7 @@ enum ApplicationRelocator {
         }
     }
 
-    private struct KeepAliveSupervisor: Sendable {
+    struct KeepAliveSupervisor: Sendable {
         let label: String
         let plistURL: URL
     }
@@ -141,7 +131,6 @@ enum ApplicationRelocator {
     private struct BundleReplacementSnapshot: Sendable {
         let bundleURL: URL
         let bundleIdentifier: String
-        let executableURL: URL
         let codeDirectoryHash: Data
         let requirementData: Data
     }
@@ -168,12 +157,6 @@ enum ApplicationRelocator {
     private static var inheritedReplacementSupervisor: KeepAliveSupervisor?
     private static var supervisorRestorationWatcher: Process?
     private static var authenticatedReplacementSourceBundleURL: URL?
-    nonisolated static let replacementHandoffPolicy = ReplacementHandoffPolicy(
-        maximumAttempts: 3,
-        initialBackoffSeconds: 2,
-        maximumBackoffSeconds: 8,
-        baseTimeoutMilliseconds: 15000,
-        maximumTimeoutMilliseconds: 60000)
     private nonisolated static let replacementSourceBundleEnvironmentKey = "OPENCLAW_REPLACEMENT_SOURCE_BUNDLE"
     private nonisolated static let replacementParentPIDEnvironmentKey = "OPENCLAW_REPLACEMENT_PARENT_PID"
     private nonisolated static let replacementCodeHashEnvironmentKey = "OPENCLAW_REPLACEMENT_CODE_HASH"
@@ -183,6 +166,7 @@ enum ApplicationRelocator {
         "OPENCLAW_REPLACEMENT_SUPERVISOR_LABEL"
     private nonisolated static let replacementSupervisorPlistEnvironmentKey =
         "OPENCLAW_REPLACEMENT_SUPERVISOR_PLIST"
+    nonisolated static let relocationRelaunchArgument = "--openclaw-relocation-relaunch"
 
     static func recommendation(for environment: Environment) -> Recommendation {
         guard !environment.isDebugOrTesting,
@@ -199,7 +183,7 @@ enum ApplicationRelocator {
                 guard let installedIdentity = candidate.identity,
                       candidate.isTrusted,
                       installedIdentity.bundleIdentifier == currentIdentity.bundleIdentifier,
-                      compareBuild(installedIdentity.buildVersion, currentIdentity.buildVersion) !=
+                      installedIdentity.buildVersion.compare(currentIdentity.buildVersion, options: .numeric) !=
                       .orderedAscending
                 else { continue }
                 return .handOff(candidate.url)
@@ -251,7 +235,16 @@ enum ApplicationRelocator {
             bundle: bundle,
             fileManager: fileManager,
             processInfo: processInfo)
-        switch self.recommendation(for: environment) {
+        let recommendation = self.recommendation(for: environment)
+        if self.shouldStopRelocationRelaunch(
+            recommendation: recommendation,
+            arguments: processInfo.arguments)
+        {
+            self.showFailure(
+                "OpenClaw is installed in Applications, but couldn’t reopen automatically. Open it there manually.")
+            return .continueLaunch(startUpdater: false)
+        }
+        switch recommendation {
         case .continueLaunch:
             #if DEBUG
             let monitorDebugReplacement = processInfo.environment["OPENCLAW_MONITOR_APP_REPLACEMENT"] == "1"
@@ -260,7 +253,6 @@ enum ApplicationRelocator {
             #endif
             if !processInfo.isRunningTests, !processInfo.isPreview, monitorDebugReplacement {
                 let monitoredBundleURL = replacementSourceBundleURL(
-                    environment: processInfo.environment,
                     fallback: bundle.bundleURL)
                 startBundleReplacementMonitoring(bundle: bundle, at: monitoredBundleURL)
             }
@@ -268,28 +260,42 @@ enum ApplicationRelocator {
         case let .handOff(destination):
             return relaunchAndTerminate(at: destination)
         case let .offerInstall(destination, replacing):
-            guard confirmInstall(replacing: replacing) else {
-                return .continueLaunch(startUpdater: false)
+            var disposition = LaunchDisposition.continueLaunch(startUpdater: false)
+            confirmInstall(replacing: replacing) { approved in
+                guard approved else { return }
+                do {
+                    try install(
+                        source: environment.bundleURL,
+                        destination: destination,
+                        replacing: replacing,
+                        fileManager: fileManager)
+                    disposition = relaunchAndTerminate(at: destination)
+                } catch {
+                    self.logger.error("Could not install app: \(error.localizedDescription, privacy: .public)")
+                    showFailure(
+                        "OpenClaw couldn’t be installed in Applications. Move it there manually, then open that copy.")
+                }
             }
-            do {
-                try install(
-                    source: environment.bundleURL,
-                    destination: destination,
-                    replacing: replacing,
-                    fileManager: fileManager)
-                return relaunchAndTerminate(at: destination)
-            } catch {
-                self.logger.error("Could not install app: \(error.localizedDescription, privacy: .public)")
-                showFailure(
-                    "OpenClaw couldn’t be installed in Applications. Move it there manually, then open that copy.")
-                return .continueLaunch(startUpdater: false)
-            }
+            return disposition
         case .cannotInstall:
             let message =
                 "OpenClaw is running from a temporary location. " +
                 "Move it to Applications manually to enable updates and launch at login."
             showFailure(message)
             return .continueLaunch(startUpdater: false)
+        }
+    }
+
+    static func shouldStopRelocationRelaunch(
+        recommendation: Recommendation,
+        arguments: [String]) -> Bool
+    {
+        guard arguments.contains(self.relocationRelaunchArgument) else { return false }
+        switch recommendation {
+        case .handOff, .offerInstall:
+            return true
+        case .continueLaunch, .cannotInstall:
+            return false
         }
     }
 
@@ -308,7 +314,6 @@ enum ApplicationRelocator {
         }
 
         let bundleURL = replacementSourceBundleURL(
-            environment: processInfo.environment,
             fallback: bundle.bundleURL)
         let isReadOnlyVolume = (try? bundleURL.resourceValues(forKeys: [.volumeIsReadOnlyKey]))?
             .volumeIsReadOnly ?? false
@@ -332,24 +337,10 @@ extension ApplicationRelocator {
         return .relaunch
     }
 
-    static func relaunchStrategy(
+    static func verifiedKeepAliveSupervisor(
         xpcServiceName: String?,
         executableURL: URL?,
-        homeDirectory: URL,
-        fileManager: FileManager = .default) -> RelaunchStrategy
-    {
-        self.verifiedKeepAliveSupervisor(
-            xpcServiceName: xpcServiceName,
-            executableURL: executableURL,
-            homeDirectory: homeDirectory,
-            fileManager: fileManager) == nil ? .openAfterTermination : .externalSupervisor
-    }
-
-    private static func verifiedKeepAliveSupervisor(
-        xpcServiceName: String?,
-        executableURL: URL?,
-        homeDirectory: URL,
-        fileManager _: FileManager = .default) -> KeepAliveSupervisor?
+        homeDirectory: URL) -> KeepAliveSupervisor?
     {
         guard let serviceName = xpcServiceName?.trimmingCharacters(in: .whitespacesAndNewlines),
               !serviceName.isEmpty,
@@ -550,7 +541,6 @@ extension ApplicationRelocator {
         processInfo: ProcessInfo) -> Environment
     {
         let bundleURL = self.replacementSourceBundleURL(
-            environment: processInfo.environment,
             fallback: bundle.bundleURL)
         let homeDirectory = fileManager.homeDirectoryForCurrentUser.standardizedFileURL
         let appName = bundleURL.lastPathComponent
@@ -595,7 +585,6 @@ extension ApplicationRelocator {
     }
 
     private static func replacementSourceBundleURL(
-        environment _: [String: String],
         fallback: URL) -> URL
     {
         self.authenticatedReplacementSourceBundleURL ?? fallback.standardizedFileURL
@@ -604,13 +593,7 @@ extension ApplicationRelocator {
     private static func startBundleReplacementMonitoring(bundle: Bundle, at monitoredBundleURL: URL) {
         self.bundleReplacementRecoveryTask?.cancel()
         self.bundleReplacementRecoveryTask = nil
-        self.bundleReplacementSource?.cancel()
-        self.bundleReplacementSource = nil
-        self.bundleReplacementSnapshot = nil
-        self.bundleReplacementCheckPending = false
-        self.bundleReplacementHandoffInProgress = false
-        self.bundleReplacementHandoffAttempt = 0
-        self.bundleReplacementHandoffTargetHash = nil
+        self.disableBundleReplacementMonitoring()
 
         let bundleURL = monitoredBundleURL.standardizedFileURL
         guard bundleURL.pathExtension == "app",
@@ -626,7 +609,6 @@ extension ApplicationRelocator {
         self.bundleReplacementSnapshot = BundleReplacementSnapshot(
             bundleURL: bundleURL,
             bundleIdentifier: bundleIdentifier,
-            executableURL: installedApp.executableURL,
             codeDirectoryHash: runningIdentity.codeDirectoryHash,
             requirementData: runningIdentity.requirementData)
 
@@ -710,7 +692,7 @@ extension ApplicationRelocator {
                     }
                     self.bundleReplacementHandoffAttempt += 1
                     let handoffAttempt = self.bundleReplacementHandoffAttempt
-                    let maximumAttempts = self.replacementHandoffPolicy.maximumAttempts
+                    let maximumAttempts = ReplacementHandoffPolicy.maximumAttempts
                     self.bundleReplacementCheckPending = false
                     self.logger.notice(
                         "Relaunching trusted replacement (attempt \(handoffAttempt)/\(maximumAttempts))")
@@ -924,24 +906,11 @@ extension ApplicationRelocator {
         matching requirement: SecRequirement?,
         fileManager: FileManager) -> Bool
     {
-        guard let executableURL = bundle.executableURL else { return false }
-        return self.isTrustedInstalledApp(
-            at: bundle.bundleURL,
-            executableURL: executableURL,
-            matching: requirement,
-            fileManager: fileManager)
-    }
-
-    private static func isTrustedInstalledApp(
-        at bundleURL: URL,
-        executableURL: URL,
-        matching requirement: SecRequirement?,
-        fileManager: FileManager) -> Bool
-    {
-        guard let requirement, fileManager.isExecutableFile(atPath: executableURL.path) else { return false }
+        guard let executableURL = bundle.executableURL,
+              let requirement, fileManager.isExecutableFile(atPath: executableURL.path) else { return false }
 
         var code: SecStaticCode?
-        guard SecStaticCodeCreateWithPath(bundleURL as CFURL, SecCSFlags(), &code) == errSecSuccess,
+        guard SecStaticCodeCreateWithPath(bundle.bundleURL as CFURL, SecCSFlags(), &code) == errSecSuccess,
               let code
         else { return false }
         return SecStaticCodeCheckValidity(
@@ -984,7 +953,7 @@ extension ApplicationRelocator {
         }
     }
 
-    private static func confirmInstall(replacing: Bool) -> Bool {
+    private static func confirmInstall(replacing: Bool, completion: @escaping (Bool) -> Void) {
         let alert = NSAlert()
         alert.messageText = replacing
             ? "Replace the older OpenClaw in Applications?"
@@ -996,8 +965,10 @@ extension ApplicationRelocator {
         alert.addButton(withTitle: replacing ? "Replace and Relaunch" : "Install and Relaunch")
         let cancel = alert.addButton(withTitle: "Not Now")
         cancel.keyEquivalent = "\u{1b}"
-        NSApp.activate(ignoringOtherApps: true)
-        return alert.runModal() == .alertFirstButtonReturn
+        AppActivation.shared.activate()
+        AppActivation.shared.presentAlert(alert) { response in
+            completion(response == .alertFirstButtonReturn)
+        }
     }
 
     private static func relaunchAndTerminate(at destination: URL) -> LaunchDisposition {
@@ -1006,15 +977,19 @@ extension ApplicationRelocator {
         let processInfo = ProcessInfo.processInfo
         helper.arguments = [
             "-c",
-            "while /bin/kill -0 \"$2\" 2>/dev/null; do /bin/sleep 0.1; done; exec /usr/bin/open -n \"$1\"",
+            "while /bin/kill -0 \"$1\" 2>/dev/null; do /bin/sleep 0.1; done; " +
+                "shift; exec /usr/bin/open \"$@\"",
             "openclaw-relocation",
-            destination.path,
             String(processInfo.processIdentifier),
+            "-n",
         ]
+        if !AppLaunchRuntimePlan.current.allowsActivation { helper.arguments?.append("-g") }
+        helper.arguments?.append(contentsOf: [destination.path, "--args", self.relocationRelaunchArgument])
+        if !AppLaunchRuntimePlan.current.allowsActivation { helper.arguments?.append("--no-activate") }
         do {
             try helper.run()
             TerminationSignalWatcher.scheduleExitFailsafe()
-            NSApp.terminate(nil)
+            AppDelegate.requestTermination()
             return .terminating
         } catch {
             self.logger.error("Could not schedule relaunch: \(error.localizedDescription, privacy: .public)")
@@ -1087,7 +1062,7 @@ extension ApplicationRelocator {
             return .failed(supervisor: supervisor)
         }
 
-        let timeoutMilliseconds = self.replacementHandoffPolicy.timeoutMilliseconds(
+        let timeoutMilliseconds = ReplacementHandoffPolicy.timeoutMilliseconds(
             loadAverage: self.currentSystemLoadAverage(),
             activeProcessorCount: processInfo.activeProcessorCount)
         Task { @MainActor in
@@ -1111,7 +1086,7 @@ extension ApplicationRelocator {
             }
             self.cancelSupervisorRestorationWatcher()
             TerminationSignalWatcher.scheduleExitFailsafe()
-            NSApp.terminate(nil)
+            AppDelegate.requestTermination()
         }
         return .scheduled
     }
@@ -1122,7 +1097,7 @@ extension ApplicationRelocator {
         supervisor: KeepAliveSupervisor?,
         reason: String) async
     {
-        let action = self.replacementHandoffPolicy.failureAction(
+        let action = ReplacementHandoffPolicy.failureAction(
             failedAttempt: attempt,
             hasKeepAliveSupervisor: supervisor != nil)
         if action.isTerminal,
@@ -1136,7 +1111,7 @@ extension ApplicationRelocator {
         switch action {
         case let .retry(delay):
             self.bundleReplacementCheckPending = true
-            let maximumAttempts = self.replacementHandoffPolicy.maximumAttempts
+            let maximumAttempts = ReplacementHandoffPolicy.maximumAttempts
             self.logger.error(
                 "Replacement handoff failed: \(reason, privacy: .public); attempt \(attempt)/\(maximumAttempts)")
             do {
@@ -1171,7 +1146,7 @@ extension ApplicationRelocator {
                 \(supervisor.label, privacy: .public) can restart the installed app.
                 """)
             TerminationSignalWatcher.scheduleExitFailsafe()
-            NSApp.terminate(nil)
+            AppDelegate.requestTermination()
         }
     }
 
@@ -1352,11 +1327,7 @@ extension ApplicationRelocator {
         alert.informativeText = message
         alert.alertStyle = .warning
         alert.addButton(withTitle: "OK")
-        alert.runModal()
-    }
-
-    private static func compareBuild(_ lhs: String, _ rhs: String) -> ComparisonResult {
-        lhs.compare(rhs, options: .numeric)
+        AppActivation.shared.presentAlert(alert)
     }
 
     private static func isInside(_ path: String, root: String) -> Bool {

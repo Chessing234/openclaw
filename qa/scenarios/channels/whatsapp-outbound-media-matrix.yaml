@@ -13,8 +13,10 @@ scenario:
     timeoutMs: 120000
     retryCount: 1
     suiteIsolation: isolated
-    config: { whatsappScenarioId: whatsapp-outbound-media-matrix }
+    config:
+      whatsappScenario: whatsappQaOutboundMediaMatrixScenario
 flow:
   module: ./live-transports/whatsapp/scenario-runtime.js
-  call: runWhatsAppOutboundMediaMatrixScenario
-  args: [{ expr: whatsappScenarioContext }]
+  call: runWhatsAppScenario
+  args:
+    - { expr: whatsappScenarioContext }

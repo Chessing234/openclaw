@@ -1,20 +1,19 @@
 import os from "node:os";
 import type { SessionEntry } from "../config/sessions.js";
-import { resolveSessionFilePath, resolveSessionFilePathOptions } from "../config/sessions/paths.js";
+import { formatSqliteSessionFileMarker } from "../config/sessions/legacy-sqlite-marker.js";
+import { preparePhysicalSessionStorePath } from "../config/sessions/session-store-path.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { formatDurationCompact } from "../infra/format-time/format-duration.ts";
+import { withTimeout } from "../infra/fs-safe.js";
 import { formatMissingCostEntries } from "../infra/session-cost-usage-totals.js";
-import {
-  loadSessionCostSummariesFromCache,
-  resolveExistingUsageSessionFile,
-} from "../infra/session-cost-usage.js";
+import { loadSessionCostSummariesFromCache } from "../infra/session-cost-usage.js";
 import { formatTokenCount, formatUsd } from "../utils/usage-format.js";
 
-export function buildStatusUptimeLine(): string {
+export function buildStatusUptimeValue(): string {
   const format = (ms: number) => formatDurationCompact(ms, { spaced: true }) ?? "0s";
   const gatewayMs = Math.max(0, Math.round(process.uptime() * 1000));
   const systemMs = Math.max(0, Math.round(os.uptime() * 1000));
-  return `⏱️ Uptime: gateway ${format(gatewayMs)} · system ${format(systemMs)}`;
+  return `gateway ${format(gatewayMs)} · system ${format(systemMs)}`;
 }
 
 async function resolveSessionCostLine(params: {
@@ -29,15 +28,10 @@ async function resolveSessionCostLine(params: {
   }
   let sessionFile: string | undefined;
   try {
-    const pathOpts = resolveSessionFilePathOptions({
-      storePath: params.storePath,
-      agentId: params.agentId,
-    });
-    sessionFile = resolveExistingUsageSessionFile({
+    sessionFile = formatSqliteSessionFileMarker({
       sessionId,
-      sessionEntry: params.sessionEntry,
-      sessionFile: resolveSessionFilePath(sessionId, params.sessionEntry, pathOpts),
       agentId: params.agentId,
+      storePath: await preparePhysicalSessionStorePath(params, params.cfg),
     });
   } catch {
     return undefined;
@@ -48,9 +42,8 @@ async function resolveSessionCostLine(params: {
   const now = Date.now();
   const date = new Date(now);
   const startMs = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
-  let timeout: NodeJS.Timeout | undefined;
   try {
-    const loaded = await Promise.race([
+    const loaded = await withTimeout(
       loadSessionCostSummariesFromCache({
         sessions: [{ sessionId, sessionFile }],
         config: params.cfg,
@@ -60,14 +53,9 @@ async function resolveSessionCostLine(params: {
         dayBucket: { mode: "utc-offset", utcOffsetMinutes: -date.getTimezoneOffset() },
         requestRefresh: false,
       }),
-      new Promise<never>((_, reject) => {
-        timeout = setTimeout(() => reject(new Error("session cost timeout")), 3_500);
-      }),
-    ]).finally(() => {
-      if (timeout) {
-        clearTimeout(timeout);
-      }
-    });
+      3_500,
+      { message: "session cost timeout" },
+    );
     const summary = loaded.cacheStatus.status === "fresh" ? loaded.summaries[0] : null;
     if (!summary) {
       return undefined;

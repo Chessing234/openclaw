@@ -20,6 +20,7 @@ function createProps(overrides: Partial<AboutProps> = {}): AboutProps {
       builtAt: BUILT_AT,
       branch: "feature/build-chip",
       dirty: true,
+      release: false,
       buildId: "test",
     },
     gatewayVersion: "2026.7.9",
@@ -85,7 +86,8 @@ describe("renderAbout", () => {
 
     const facts = container.querySelector(".settings-kv");
     const values = facts?.querySelectorAll("dd");
-    expect(facts?.getAttribute("role")).toBe("group");
+    expect(facts?.tagName).toBe("DL");
+    expect(facts?.hasAttribute("role")).toBe(false);
     expect(facts?.getAttribute("aria-label")).toBe("Control UI build details");
     expect(facts?.classList.contains("about-build-grid")).toBe(true);
     expect(values).toHaveLength(4);
@@ -162,6 +164,7 @@ describe("renderAbout", () => {
             builtAt: null,
             branch: null,
             dirty: null,
+            release: false,
             buildId: "dev",
           },
           gatewayVersion: null,

@@ -1,18 +1,19 @@
 import { isDeepStrictEqual } from "node:util";
 import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
 import { normalizeOptionalAgentRuntimeId } from "../../../agents/agent-runtime-id.js";
+import { isLegacyCodexProviderId } from "../../../config/legacy-codex-provider.js";
 import { getRecord, type LegacyConfigRule } from "../../../config/legacy.shared.js";
 import type { ModelDefinitionConfig } from "../../../config/types.models.js";
 import {
-  isLegacyCodexProviderId,
   legacyCodexProviderIdentityKey,
   type LegacyCodexModelIdentity,
 } from "./codex-route-model-ref.js";
 import {
-  RETIRED_MODEL_REF_MESSAGE,
+  MODEL_REF_CANONICALIZATION_MESSAGE,
   hasOwnDefinedProperty,
   scanKnownModelRefs,
 } from "./legacy-config-migrations.runtime.models.refs.js";
+import { visitAgentConfigScopes } from "./legacy-config-record-shared.js";
 import { isLegacyModelsAddCodexMetadataModel } from "./legacy-models-add-metadata.js";
 
 export const LEGACY_OPENAI_CODEX_RESPONSES_API = "openai-codex-responses";
@@ -154,21 +155,10 @@ function getMergeableLegacyOpenAIModels(params: {
 
 function collectLegacyModelPolicyWildcardPaths(raw: unknown): Map<string, string[]> {
   const pathsByProvider = new Map<string, string[]>();
-  const agents = getRecord(getRecord(raw)?.agents);
-  const scopes: Array<{ value: unknown; path: string }> = [
-    { value: getRecord(agents?.defaults)?.modelPolicy, path: "agents.defaults.modelPolicy" },
-  ];
-  const list = Array.isArray(agents?.list) ? agents.list : [];
-  for (const [index, agent] of list.entries()) {
-    scopes.push({
-      value: getRecord(agent)?.modelPolicy,
-      path: `agents.list.${index}.modelPolicy`,
-    });
-  }
-  for (const scope of scopes) {
-    const allow = getRecord(scope.value)?.allow;
+  visitAgentConfigScopes(getRecord(raw) ?? {}, (agent, path) => {
+    const allow = getRecord(agent.modelPolicy)?.allow;
     if (!Array.isArray(allow)) {
-      continue;
+      return;
     }
     for (const [index, entry] of allow.entries()) {
       if (typeof entry !== "string" || !entry.trim().endsWith("/*")) {
@@ -179,10 +169,10 @@ function collectLegacyModelPolicyWildcardPaths(raw: unknown): Map<string, string
         continue;
       }
       const paths = pathsByProvider.get(provider) ?? [];
-      paths.push(`${scope.path}.allow.${index}`);
+      paths.push(`${path}.modelPolicy.allow.${index}`);
       pathsByProvider.set(provider, paths);
     }
-  }
+  });
   return pathsByProvider;
 }
 
@@ -208,27 +198,12 @@ export function hasAutoFixableLegacyOpenAICodexProvider(
     if (normalized.changed || !canonicalEntry) {
       return true;
     }
-    const modelCollisions = collectNonEquivalentLegacyOpenAIModelCollisions({
-      canonical: canonicalEntry.value,
-      legacy: normalized.value,
-      legacyProviderId: providerId,
-    });
-    if (modelCollisions.length > 0) {
-      continue;
-    }
-    const modelsToMerge = getMergeableLegacyOpenAIModels({
-      canonical: canonicalEntry.value,
-      legacy: normalized.value,
-    });
-    if (modelsToMerge.length === 0) {
-      return true;
-    }
-    const mergeBlockers = collectModelMergeBlockers({
-      canonical: canonicalEntry.value,
-      legacy: normalized.value,
-      legacyProviderId: providerId,
-    });
-    if (mergeBlockers.length === 0) {
+    const { modelCollisions, mergeBlockers } = inspectLegacyOpenAIProviderMerge(
+      canonicalEntry.value,
+      normalized.value,
+      providerId,
+    );
+    if (modelCollisions.length === 0 && mergeBlockers.length === 0) {
       return true;
     }
   }
@@ -267,34 +242,12 @@ export function collectBlockedLegacyOpenAICodexProviderPlan(
       continue;
     }
     const normalized = normalizeLegacyOpenAIResponsesApi(providerId, provider, []);
-    const modelCollisions = collectNonEquivalentLegacyOpenAIModelCollisions({
-      canonical: canonicalEntry.value,
-      legacy: normalized.value,
-      legacyProviderId: providerId,
-    });
-    if (modelCollisions.length > 0) {
-      const identity = legacyCodexProviderIdentityKey(providerId);
-      if (identity) {
-        blockedModelIdentities.add(identity);
-      }
-      warningLines.push(
-        `- models.providers.${providerId} cannot be merged automatically into models.providers.${canonicalEntry.key} because colliding model definitions differ for: ${modelCollisions.join(", ")}.`,
-      );
-      continue;
-    }
-    const modelsToMerge = getMergeableLegacyOpenAIModels({
-      canonical: canonicalEntry.value,
-      legacy: normalized.value,
-    });
-    if (modelsToMerge.length === 0) {
-      continue;
-    }
-    const mergeBlockers = collectModelMergeBlockers({
-      canonical: canonicalEntry.value,
-      legacy: normalized.value,
-      legacyProviderId: providerId,
-    });
-    if (mergeBlockers.length === 0) {
+    const { modelCollisions, mergeBlockers } = inspectLegacyOpenAIProviderMerge(
+      canonicalEntry.value,
+      normalized.value,
+      providerId,
+    );
+    if (modelCollisions.length === 0 && mergeBlockers.length === 0) {
       continue;
     }
     const identity = legacyCodexProviderIdentityKey(providerId);
@@ -302,7 +255,9 @@ export function collectBlockedLegacyOpenAICodexProviderPlan(
       blockedModelIdentities.add(identity);
     }
     warningLines.push(
-      `- models.providers.${providerId} cannot be merged automatically into models.providers.${canonicalEntry.key} because provider-level defaults cannot be represented safely on merged models: ${mergeBlockers.join(", ")}.`,
+      modelCollisions.length > 0
+        ? `- models.providers.${providerId} cannot be merged automatically into models.providers.${canonicalEntry.key} because colliding model definitions differ for: ${modelCollisions.join(", ")}.`
+        : `- models.providers.${providerId} cannot be merged automatically into models.providers.${canonicalEntry.key} because provider-level defaults cannot be represented safely on merged models: ${mergeBlockers.join(", ")}.`,
     );
   }
   // Intentionally fail closed: retained legacy refs are NOT executable until
@@ -458,6 +413,21 @@ function collectNonEquivalentLegacyOpenAIModelCollisions(params: {
   return [...conflicts];
 }
 
+function inspectLegacyOpenAIProviderMerge(
+  canonical: Record<string, unknown>,
+  legacy: Record<string, unknown>,
+  legacyProviderId: string,
+) {
+  const params = { canonical, legacy, legacyProviderId };
+  const modelCollisions = collectNonEquivalentLegacyOpenAIModelCollisions(params);
+  const modelsToMerge = getMergeableLegacyOpenAIModels(params);
+  const mergeBlockers =
+    modelCollisions.length === 0 && modelsToMerge.length > 0
+      ? collectModelMergeBlockers(params)
+      : [];
+  return { modelCollisions, modelsToMerge, mergeBlockers };
+}
+
 function prepareLegacyCodexProviderForCanonicalMove(
   providerId: string,
   provider: Record<string, unknown>,
@@ -491,7 +461,6 @@ export function migrateLegacyOpenAICodexProvider(
   if (!models || !providers) {
     return;
   }
-  let providersChanged = false;
   const wildcardPaths = collectLegacyModelPolicyWildcardPaths(raw);
   for (const [providerId, providerValue] of Object.entries({ ...providers })) {
     const provider = getRecord(providers[providerId]) ?? getRecord(providerValue);
@@ -505,7 +474,6 @@ export function migrateLegacyOpenAICodexProvider(
     if (!isLegacyCodexProviderId(providerId)) {
       if (normalized.changed) {
         providers[providerId] = normalized.value;
-        providersChanged = true;
       }
       continue;
     }
@@ -528,27 +496,14 @@ export function migrateLegacyOpenAICodexProvider(
       const canonicalModels: unknown[] = Array.isArray(canonical.models)
         ? (canonical.models as unknown[])
         : [];
-      const modelCollisions = collectNonEquivalentLegacyOpenAIModelCollisions({
+      const { modelCollisions, modelsToMerge, mergeBlockers } = inspectLegacyOpenAIProviderMerge(
         canonical,
-        legacy: normalized.value,
-        legacyProviderId: providerId,
-      });
-      const modelsToMerge = getMergeableLegacyOpenAIModels({
-        canonical,
-        legacy: normalized.value,
-      });
-      const mergeBlockers =
-        modelCollisions.length === 0 && modelsToMerge.length > 0
-          ? collectModelMergeBlockers({
-              canonical,
-              legacy: normalized.value,
-              legacyProviderId: providerId,
-            })
-          : [];
+        normalized.value,
+        providerId,
+      );
       if (modelCollisions.length > 0 || mergeBlockers.length > 0) {
         if (normalized.changed) {
           providers[providerId] = normalized.value;
-          providersChanged = true;
           changes.push(
             modelCollisions.length > 0
               ? `Skipped merging models.providers.${providerId} into models.providers.${OPENAI_PROVIDER_ID} because colliding model definitions differ for: ${modelCollisions.join(", ")}.`
@@ -585,14 +540,10 @@ export function migrateLegacyOpenAICodexProvider(
       }
     }
     delete providers[providerId];
-    providersChanged = true;
-  }
-  if (providersChanged) {
-    models.providers = providers;
   }
 }
 
-export const RETIRED_MODEL_REF_RULES: LegacyConfigRule[] = [
+export const MODEL_REF_CANONICALIZATION_RULES: LegacyConfigRule[] = [
   "agents",
   "plugins",
   "messages",
@@ -602,6 +553,6 @@ export const RETIRED_MODEL_REF_RULES: LegacyConfigRule[] = [
   "models",
 ].map((section) => ({
   path: [section],
-  message: RETIRED_MODEL_REF_MESSAGE,
+  message: MODEL_REF_CANONICALIZATION_MESSAGE,
   match: (value) => scanKnownModelRefs(value),
 }));

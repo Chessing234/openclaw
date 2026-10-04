@@ -1,7 +1,6 @@
-// Root help renderer that combines core, sub-CLI, and optional plugin command descriptors.
 import { Command } from "commander";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import { getPluginCliCommandDescriptors } from "../../plugins/cli.js";
+import { getPluginCliCommandDescriptors } from "../../plugins/cli-root-descriptors.js";
 import type { PluginLoadOptions } from "../../plugins/loader.js";
 import { VERSION } from "../../version.js";
 import {
@@ -10,31 +9,25 @@ import {
 } from "./command-descriptor-utils.js";
 import { getCoreCliCommandDescriptors } from "./core-command-descriptors.js";
 import { configureProgramHelp, formatProgramHelpOutput } from "./help.js";
-import { getSubCliEntries } from "./subcli-descriptors.js";
+import { getSubCliEntriesCore } from "./subcli-descriptors.js";
 
 /** Options for rendering root help without fully registering the live CLI. */
 export type RootHelpRenderOptions = Pick<PluginLoadOptions, "pluginSdkResolution"> & {
   config?: OpenClawConfig;
   env?: NodeJS.ProcessEnv;
-  includePluginDescriptors?: boolean;
 };
 
-async function buildRootHelpProgram(renderOptions?: RootHelpRenderOptions): Promise<Command> {
+/** Render root help text without registering command runtimes. */
+export async function renderRootHelpText(renderOptions?: RootHelpRenderOptions): Promise<string> {
   const program = new Command();
-  const pluginDescriptors =
-    renderOptions?.includePluginDescriptors === true || renderOptions?.config
-      ? await getPluginCliCommandDescriptors(renderOptions.config, renderOptions.env, {
-          pluginSdkResolution: renderOptions.pluginSdkResolution,
-        })
-      : [];
+  const pluginDescriptors = renderOptions?.config
+    ? await getPluginCliCommandDescriptors(renderOptions.config, renderOptions.env, {
+        pluginSdkResolution: renderOptions.pluginSdkResolution,
+      })
+    : [];
   configureProgramHelp(
     program,
-    {
-      programVersion: VERSION,
-      channelOptions: [],
-      messageChannelOptions: "",
-      agentChannelOptions: "",
-    },
+    { programVersion: VERSION },
     {
       commandsWithSubcommands: new Set(
         pluginDescriptors
@@ -48,17 +41,11 @@ async function buildRootHelpProgram(renderOptions?: RootHelpRenderOptions): Prom
     program,
     collectUniqueCommandDescriptors([
       getCoreCliCommandDescriptors(),
-      getSubCliEntries(),
+      getSubCliEntriesCore(),
       pluginDescriptors,
     ]),
   );
 
-  return program;
-}
-
-/** Render root help text for tests, docs, and command output. */
-export async function renderRootHelpText(renderOptions?: RootHelpRenderOptions): Promise<string> {
-  const program = await buildRootHelpProgram(renderOptions);
   let output = "";
   program.configureOutput({ writeOut: (chunk) => (output += formatProgramHelpOutput(chunk)) });
   program.outputHelp();

@@ -25,7 +25,6 @@ describe("transcribeFirstAudio", () => {
   it("runs audio preflight in auto mode when audio config is absent", async () => {
     runAudioTranscriptionMock.mockResolvedValueOnce({
       transcript: "voice note transcript",
-      attachments: [],
     });
 
     const ctx: MsgContext = {
@@ -42,6 +41,43 @@ describe("transcribeFirstAudio", () => {
     expect(sendTranscriptEchoMock).not.toHaveBeenCalled();
     expect(ctx.media?.[0]?.transcribed).not.toBe(true);
     expect(ctx.media?.[1]?.transcribed).toBe(true);
+  });
+
+  it("transcribes AIFF voice notes without an explicit content type", async () => {
+    runAudioTranscriptionMock.mockResolvedValueOnce({
+      transcript: "AIFF voice note transcript",
+    });
+
+    const ctx: MsgContext = {
+      Body: "<media:audio>",
+      media: [{ path: "/tmp/voice.aiff" }],
+    };
+
+    await expect(transcribeFirstAudio({ ctx, cfg: {} })).resolves.toBe(
+      "AIFF voice note transcript",
+    );
+    expect(runAudioTranscriptionMock).toHaveBeenCalledOnce();
+    expect(ctx.media?.[0]?.transcribed).toBe(true);
+  });
+
+  it("transcribes an opaque audio source identified by separate filename metadata", async () => {
+    runAudioTranscriptionMock.mockResolvedValueOnce({
+      transcript: "voice note transcript",
+    });
+    const ctx: MsgContext = {
+      Body: "<media:audio>",
+      media: [
+        {
+          url: "https://cdn.example.test/download/opaque",
+          fileName: "voice.ogg",
+          contentType: "application/octet-stream",
+        },
+      ],
+    };
+
+    await expect(transcribeFirstAudio({ ctx, cfg: {} })).resolves.toBe("voice note transcript");
+    expect(runAudioTranscriptionMock).toHaveBeenCalledOnce();
+    expect(ctx.media?.[0]?.transcribed).toBe(true);
   });
 
   it("skips audio preflight when audio config is explicitly disabled", async () => {
@@ -69,7 +105,6 @@ describe("transcribeFirstAudio", () => {
   it("echoes the preflight transcript when echoTranscript is enabled", async () => {
     runAudioTranscriptionMock.mockResolvedValueOnce({
       transcript: "hello from dm audio",
-      attachments: [],
     });
 
     const ctx = {

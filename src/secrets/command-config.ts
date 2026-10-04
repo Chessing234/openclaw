@@ -1,6 +1,7 @@
 /** Collects and analyzes command-scoped secret assignments from OpenClaw config. */
+import { getAuthoredConfigSecretRef, resolveConfigSecretRef } from "../config/resolution-facts.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { coerceSecretRef, resolveSecretInputRef } from "../config/types.secrets.js";
+import { parseSecretRef } from "../config/types.secrets.js";
 import { getPath } from "./path-utils.js";
 import { isExpectedResolvedSecretValue } from "./secret-value.js";
 import { discoverConfigSecretTargetsByIds } from "./target-registry.js";
@@ -48,18 +49,23 @@ export function analyzeCommandSecretAssignmentsFromSnapshot(params: {
     if (params.allowedPaths && !params.allowedPaths.has(target.path)) {
       continue;
     }
-    const { explicitRef, ref } = resolveSecretInputRef({
+    const inlineCandidateRef = resolveConfigSecretRef({
+      config: params.sourceConfig,
+      path: target.path,
       value: target.value,
-      refValue: target.refValue,
       defaults,
     });
-    const inlineCandidateRef = explicitRef ? coerceSecretRef(target.value, defaults) : null;
+    const explicitRef = parseSecretRef(target.refValue, defaults);
+    const ref = explicitRef ?? inlineCandidateRef;
     if (!ref) {
       continue;
     }
 
     const resolved = getPath(params.resolvedConfig, target.pathSegments);
-    if (!isExpectedResolvedSecretValue(resolved, target.entry.expectedResolvedValue)) {
+    if (
+      getAuthoredConfigSecretRef(params.resolvedConfig, target.path) ||
+      !isExpectedResolvedSecretValue(resolved, target.entry.expectedResolvedValue)
+    ) {
       // Inactive surfaces are diagnostics, not hard failures; active unresolved refs block the
       // command because the runtime snapshot promised that target was usable.
       if (params.inactiveRefPaths?.has(target.path)) {

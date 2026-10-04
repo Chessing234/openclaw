@@ -11,8 +11,10 @@ scenario:
     timeoutMs: 8000
     retryCount: 1
     suiteIsolation: isolated
-    config: { whatsappScenarioId: whatsapp-group-allowlist-block }
+    config:
+      whatsappScenario: whatsappQaGroupAllowlistBlockScenario
 flow:
   module: ./live-transports/whatsapp/scenario-runtime.js
-  call: runWhatsAppGroupAllowlistBlockScenario
-  args: [{ expr: whatsappScenarioContext }]
+  call: runWhatsAppScenario
+  args:
+    - { expr: whatsappScenarioContext }

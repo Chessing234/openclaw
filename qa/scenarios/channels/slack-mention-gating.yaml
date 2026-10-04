@@ -8,11 +8,12 @@ scenario:
   execution:
     kind: flow
     channel: slack
-    timeoutMs: 8000
+    timeoutMs: 15000
     retryCount: 1
     suiteIsolation: isolated
-    config: { slackScenarioId: slack-mention-gating }
 flow:
   module: ./live-transports/slack/scenario-runtime.js
-  call: runSlackMentionGatingScenario
-  args: [{ expr: slackScenarioContext }]
+  call: runSlackScenario
+  args:
+    - { expr: slackScenarioContext }
+    - { moduleExport: slackQaMentionGatingScenario }

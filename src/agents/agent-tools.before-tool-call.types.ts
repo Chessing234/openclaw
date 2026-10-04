@@ -3,6 +3,7 @@
  * Kept separate from the facade so implementation modules do not import back
  * through the barrel that re-exports them.
  */
+import type { ToolLoopWarning } from "@openclaw/agent-core";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { ToolLoopDetectionConfig } from "../config/types.tools.js";
 import type { DiagnosticToolTerminalReason } from "../infra/diagnostic-events.js";
@@ -32,6 +33,8 @@ export type ToolOutcomeObserver = (observation: ToolOutcomeObservation) => void;
 export type HookContext = {
   agentId?: string;
   config?: OpenClawConfig;
+  /** Selected tool registration owner; independent of the hook requesting approval. */
+  toolOwnerPluginId?: string;
   /** Tool execution cwd for host-derived path facts. */
   cwd?: string;
   /** Host workspace used to resolve relative tool params for diagnostics only. */
@@ -40,6 +43,8 @@ export type HookContext = {
   /** Ephemeral session UUID — regenerated on /new and /reset. */
   sessionId?: string;
   runId?: string;
+  /** What initiated this run, used to reject approvals on unattended surfaces. */
+  trigger?: string;
   /** Device-scoped operator session allowed to review approvals initiated by this run. */
   approvalReviewerDeviceId?: string;
   trace?: DiagnosticTraceContext;
@@ -95,6 +100,7 @@ export type HookBlockedReason =
   | "client-voice-confirmation"
   | "plugin-before-tool-call"
   | "plugin-approval"
+  | "plugin-approval-unavailable"
   | "tool-loop";
 
 type HookBlockedOutcome = {
@@ -105,7 +111,7 @@ type HookBlockedOutcome = {
 };
 
 export type HookOutcome =
-  | (HookBlockedOutcome & { kind: "veto" })
+  | (HookBlockedOutcome & { kind: "veto"; genericDecision?: true })
   | (HookBlockedOutcome & {
       kind: "failure";
       disposition: BeforeToolCallFailureDisposition;
@@ -113,6 +119,8 @@ export type HookOutcome =
   | {
       blocked: false;
       params: unknown;
+      ownerDecision?: true;
       approvalResolution?: PluginApprovalResolution;
       deferredApproval?: DeferredPluginToolApproval;
+      loopWarning?: ToolLoopWarning;
     };

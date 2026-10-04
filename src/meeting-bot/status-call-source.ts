@@ -1,3 +1,5 @@
+import { createMeetingRoutingOwnershipSource } from "./status-call-ownership-source.js";
+
 type MeetingStatusCallSourceOptions = {
   captionEnableSource: string;
   captionSettleMs?: number;
@@ -12,6 +14,10 @@ type MeetingStatusCallSourceOptions = {
     manualActionReasonPrefix: string;
   };
   extraResultSource?: string;
+  /** In-page boolean expression that revalidates call ownership after media-routing awaits. */
+  liveOwnershipSource?: string;
+  /** In-page statements run once audio routing settles, before captions and the status result. */
+  afterAudioRoutingSource?: string;
   transcriptMaxLines?: number;
 };
 
@@ -21,11 +27,29 @@ export function createMeetingStatusCallSource(options: MeetingStatusCallSourceOp
   const captionsGlobal = JSON.stringify(options.platform.globals.captions);
   const meetingGlobal = JSON.stringify(options.platform.globals.meeting);
   const transcriptMaxLines = options.transcriptMaxLines ?? 500;
+  const withLiveOwnership = (source: string) =>
+    options.liveOwnershipSource === undefined ? "" : source;
+  const ownershipCheck = (indent: number) =>
+    withLiveOwnership(
+      `\n${" ".repeat(indent)}if (!recheckAudioOwnership()) break audioOutputRouting;`,
+    );
   return `  let audioOutputRouted;
   let audioOutputDeviceLabel;
   let audioOutputRouteError;
-  let audioOutputRouteRetryable = false;
-  if (inCall && allowMicrophone && navigator.mediaDevices?.enumerateDevices) {
+  let audioOutputRouteRetryable = false;${
+    options.liveOwnershipSource === undefined
+      ? ""
+      : createMeetingRoutingOwnershipSource({
+          liveOwnershipSource: options.liveOwnershipSource,
+          meetingGlobal,
+        })
+  }
+  const remoteCapture = window.__openclawMeetingRemoteAudio;
+  if (remoteCapture && remoteCapture.sessionId === sessionId && remoteCapture.isCurrent()) {
+    if (canMutateSession) remoteCapture.scan();
+    audioOutputRouted = remoteCapture.isCurrent();
+    audioOutputDeviceLabel = "Isolated browser playback";
+  } else if (inCall && allowMicrophone && navigator.mediaDevices?.enumerateDevices) {
     const media = [...document.querySelectorAll("audio, video")].filter(
       (element) =>
         typeof element.setSinkId === "function" &&
@@ -33,8 +57,10 @@ export function createMeetingStatusCallSource(options: MeetingStatusCallSourceOp
     );
     if (media.length > 0) {
       try {
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        const output = devices.find((device) => device.kind === "audiooutput" && isBlackHole(device.label));
+        const devices = await navigator.mediaDevices.enumerateDevices();${ownershipCheck(8)}
+        const output = devices.find(
+          (device) => device.kind === "audiooutput" && isVirtualAudioDevice(device.label)
+        );
         if (output?.deviceId) {
           const routeErrors = [];
           const liveStream = (element) =>
@@ -68,8 +94,15 @@ export function createMeetingStatusCallSource(options: MeetingStatusCallSourceOp
                 originalMuteBySource.set(element, Boolean(element.muted));
               }
               // Sink changes are asynchronous. Silence the physical output until either
-              // the source or its fallback bridge is confirmed on BlackHole.
-              element.muted = true;
+              // the source or its fallback bridge is confirmed on the virtual device.
+              ${withLiveOwnership(`routingSources.push({
+                element,
+                muted: originalMuteBySource.get(element),
+                sinkId: element.sinkId,
+                stream: element.srcObject,
+                url: mediaSourceUrl(element),
+              });
+              `)}element.muted = true;
             }
           }
           const currentSources = new Set(routeCandidates.map((entry) => entry.element));
@@ -126,9 +159,9 @@ export function createMeetingStatusCallSource(options: MeetingStatusCallSourceOp
             let directRouteError;
             if (canMutateSession && !elementRouted) {
               try {
-                await element.setSinkId(output.deviceId);
+                await element.setSinkId(output.deviceId);${ownershipCheck(16)}
                 elementRouted = element.sinkId === output.deviceId;
-              } catch (error) {
+              } catch (error) {${ownershipCheck(16)}
                 directRouteError = {
                   message: error?.message || String(error),
                   retryable: error?.name === "AbortError",
@@ -192,16 +225,16 @@ export function createMeetingStatusCallSource(options: MeetingStatusCallSourceOp
                   sourceUrl: mediaSourceUrl(element),
                   stream,
                 };
-                bridgeEntries.push(entry);
+                bridgeEntries.push(entry);${withLiveOwnership("\n                routingBridges.push(entry);")}
                 suspendedBySource.delete(element);
               }
               if (entry?.bridge) {
                 try {
                   if (canMutateSession) {
                     if (entry.bridge.sinkId !== output.deviceId) {
-                      await entry.bridge.setSinkId(output.deviceId);
+                      await entry.bridge.setSinkId(output.deviceId);${ownershipCheck(22)}
                     }
-                    await entry.bridge.play();
+                    await entry.bridge.play();${ownershipCheck(20)}
                     entry.playing = true;
                   }
                   elementRouted =
@@ -210,7 +243,7 @@ export function createMeetingStatusCallSource(options: MeetingStatusCallSourceOp
                     suspendedBySource.delete(element);
                     if (canMutateSession && !entry.sourceMuted) element.muted = true;
                   }
-                } catch (error) {
+                } catch (error) {${ownershipCheck(18)}
                   entry.playing = false;
                   if (canMutateSession) retireAudioBridge(entry, false);
                   routeErrors.push({
@@ -237,9 +270,13 @@ export function createMeetingStatusCallSource(options: MeetingStatusCallSourceOp
           audioOutputRouted = routed.length > 0 && routed.every(Boolean);
           if (canMutateSession && !audioOutputRouted) suspendOwnedAudioBridges();
           if (audioOutputRouted && bridgeEntries.length > 0) {
-            notes.push("Routed ${options.platform.displayName} remote audio to BlackHole 2ch through MediaStream bridges.");
+            notes.push(
+              "Routed ${options.platform.displayName} remote audio to " +
+              (output.label || "the virtual audio device") +
+              " through MediaStream bridges."
+            );
           }
-          audioOutputDeviceLabel = output.label || "BlackHole 2ch";
+          audioOutputDeviceLabel = output.label || "Virtual audio device";
           // An unloaded Teams media element can reject setSinkId before its stream
           // arrives. Keep that state retryable; loaded-source failures are terminal.
           if (!audioOutputRouted && routed.length > 0 && routeErrors.length > 0) {
@@ -249,32 +286,32 @@ export function createMeetingStatusCallSource(options: MeetingStatusCallSourceOp
         } else {
           audioOutputRouted = false;
           if (canMutateSession) suspendOwnedAudioBridges();
-          notes.push("BlackHole 2ch speaker output was not visible to ${options.platform.displayName}.");
+          notes.push("The OpenClaw virtual audio speaker output was not visible to ${options.platform.displayName}.");
         }
-      } catch (error) {
+      } catch (error) {${ownershipCheck(8)}
         audioOutputRouted = false;
         audioOutputRouteError = error?.message || String(error);
         if (canMutateSession) suspendOwnedAudioBridges();
       }
       if (!audioOutputRouted && audioOutputRouteError) {
-        notes.push("Could not route ${options.platform.displayName} speaker output to BlackHole 2ch: " + audioOutputRouteError);
+        notes.push("Could not route ${options.platform.displayName} speaker output to the OpenClaw virtual audio device: " + audioOutputRouteError);
       }
     } else {
       audioOutputRouted = false;
       try {
-        const devices = await navigator.mediaDevices.enumerateDevices();
+        const devices = await navigator.mediaDevices.enumerateDevices();${ownershipCheck(8)}
         const output = devices.find(
-          (device) => device.kind === "audiooutput" && isBlackHole(device.label)
+          (device) => device.kind === "audiooutput" && isVirtualAudioDevice(device.label)
         );
         if (output?.deviceId) {
           // Teams can briefly remove every media element during an in-call rerender.
           // Retry only after proving the required output still exists.
           audioOutputRouteRetryable = true;
-          audioOutputDeviceLabel = output.label || "BlackHole 2ch";
+          audioOutputDeviceLabel = output.label || "Virtual audio device";
         } else {
-          notes.push("BlackHole 2ch speaker output was not visible to ${options.platform.displayName}.");
+          notes.push("The OpenClaw virtual audio speaker output was not visible to ${options.platform.displayName}.");
         }
-      } catch (error) {
+      } catch (error) {${ownershipCheck(8)}
         audioOutputRouteError = error?.message || String(error);
         notes.push("Could not inspect ${options.platform.displayName} speaker outputs: " + audioOutputRouteError);
       }
@@ -285,7 +322,12 @@ export function createMeetingStatusCallSource(options: MeetingStatusCallSourceOp
     audioOutputRouted = false;
     if (canMutateSession) retireOwnedAudioBridges();
   }
-  let captioning = false;
+${withLiveOwnership("  }\n")}${
+    options.afterAudioRoutingSource
+      ? // The hook may await; recheck ownership after it so this pass's routing still rolls back.
+        `  ${options.afterAudioRoutingSource}\n${withLiveOwnership("  recheckAudioOwnership();\n")}`
+      : ""
+  }  let captioning = false;
   let captionsEnabledAttempted = false;
   let transcriptLines = 0;
   let lastCaptionAt;
@@ -331,8 +373,6 @@ export function createMeetingStatusCallSource(options: MeetingStatusCallSourceOp
     if (!inCall && !active) return undefined;
     if (!active && !canMutateSession) return undefined;
     if (!active) {
-      if (active?.settleTimer !== undefined) clearTimeout(active.settleTimer);
-      active?.observer?.disconnect?.();
       window[${captionsGlobal}] = {
         sessionId,
         identity: expectedIdentity,
@@ -356,17 +396,14 @@ export function createMeetingStatusCallSource(options: MeetingStatusCallSourceOp
     if (!clean) return undefined;
     return { speaker: cleanSpeaker || undefined, text: clean };
   };
-  const captionRowIdentity = (row) =>
+  const captionRowIdentity = (row) => {
     // aria-posinset identifies the logical caption item across virtual-list
     // rerenders. DOM ids and data indexes can belong to the recycled element.
-    ["aria-posinset"]
-      .map((name) => {
-        const value = row?.getAttribute?.(name);
-        return typeof value === "string" && value.trim()
-          ? name + ":" + value.trim()
-          : undefined;
-      })
-      .find(Boolean);
+    const value = row?.getAttribute?.("aria-posinset");
+    return typeof value === "string" && value.trim()
+      ? "aria-posinset:" + value.trim()
+      : undefined;
+  };
   const sameCaptionUtterance = (prior, current) => {
     if (prior.rowIdentity || current.rowIdentity) {
       return Boolean(
@@ -378,6 +415,10 @@ export function createMeetingStatusCallSource(options: MeetingStatusCallSourceOp
     if (prior.speaker && current.speaker && prior.speaker !== current.speaker) return false;
     return prior.node === current.node;
   };
+  const sameCaptionRow = (left, right) =>
+    right.rowIdentity
+      ? left.rowIdentity === right.rowIdentity
+      : left.node === right.node;
   const commitCaptionLines = (state, entries) => {
     state.lines.push(...entries.map((entry) => {
       entry.utteranceId ||= crypto.randomUUID();
@@ -393,12 +434,6 @@ export function createMeetingStatusCallSource(options: MeetingStatusCallSourceOp
       state.lines.splice(0, excess);
       state.droppedLines = (state.droppedLines || 0) + excess;
     }
-  };
-  const sameCaptionRow = (left, right) =>
-    right.rowIdentity
-      ? left.rowIdentity === right.rowIdentity
-      : left.node === right.node;
-  const retainSettledCaptionLines = (state, entries) => {
     const settled = [...state.settled];
     for (const entry of entries) {
       const priorIndex = settled.findIndex((candidate) => sameCaptionRow(candidate, entry));
@@ -415,7 +450,6 @@ export function createMeetingStatusCallSource(options: MeetingStatusCallSourceOp
     pendingState.settleTimer = setTimeout(() => {
       if (window[${captionsGlobal}] !== pendingState) return;
       commitCaptionLines(pendingState, pendingState.visible);
-      retainSettledCaptionLines(pendingState, pendingState.visible);
       pendingState.visible = [];
       pendingState.settleTimer = undefined;
     }, ${captionSettleMs});
@@ -476,7 +510,6 @@ export function createMeetingStatusCallSource(options: MeetingStatusCallSourceOp
       captionState.settleTimer = undefined;
       captionState.visible = captionState.visible.filter((entry) => !rowWasRemoved(entry));
       commitCaptionLines(captionState, removedVisible);
-      retainSettledCaptionLines(captionState, removedVisible);
     }
     const retainedLineIds = new Set(captionState.lines.map((entry) => entry.utteranceId));
     captionState.settled = captionState.settled.filter((entry) =>
@@ -531,11 +564,7 @@ export function createMeetingStatusCallSource(options: MeetingStatusCallSourceOp
     const now = Date.now();
     let captionChanged = false;
     for (const row of parsedRows) {
-      const priorIndex = unmatchedPrevious.findIndex((candidate) =>
-        row.rowIdentity
-          ? candidate.rowIdentity === row.rowIdentity
-          : candidate.node === row.node
-      );
+      const priorIndex = unmatchedPrevious.findIndex((candidate) => sameCaptionRow(candidate, row));
       const candidate = priorIndex >= 0 ? unmatchedPrevious[priorIndex] : undefined;
       const prior = candidate && sameCaptionUtterance(candidate, row)
         ? unmatchedPrevious.splice(priorIndex, 1)[0]
@@ -565,7 +594,6 @@ export function createMeetingStatusCallSource(options: MeetingStatusCallSourceOp
     }
     captionChanged ||= unmatchedPrevious.length > 0;
     commitCaptionLines(captionState, unmatchedPrevious);
-    retainSettledCaptionLines(captionState, unmatchedPrevious);
     captionState.visible = nextVisible;
     // Identity-less rows stay mutable while rendered; removal is their only
     // reliable utterance boundary. Stable logical rows may settle on quiet.
@@ -611,7 +639,7 @@ export function createMeetingStatusCallSource(options: MeetingStatusCallSourceOp
   }
   if (inCall && allowMicrophone && !manualAction) {
     if (audioInputRouted !== true || audioOutputRouted !== true) {
-      manualAction = manualActionFor("${options.platform.manualActionReasonPrefix}-audio-choice-required", "Verify BlackHole 2ch is selected as both the ${options.platform.displayName} microphone and speaker before starting talk-back.");
+      manualAction = manualActionFor("${options.platform.manualActionReasonPrefix}-audio-choice-required", "Verify the OpenClaw virtual audio device is selected as both the ${options.platform.displayName} microphone and speaker before starting talk-back.");
     } else if (micMuted !== false) {
       manualAction = manualActionFor("${options.platform.manualActionReasonPrefix}-microphone-required", "Unmute the ${options.platform.displayName} microphone and verify the microphone control shows it is on before starting talk-back.");
     }

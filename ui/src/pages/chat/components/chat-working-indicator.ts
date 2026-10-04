@@ -1,31 +1,22 @@
 import { html, nothing } from "lit";
+import type { ThemeMascot } from "../../../../../packages/gateway-protocol/src/theme.ts";
 import "../../../components/elapsed-time.ts";
-import { icons } from "../../../components/icons.ts";
 import "../../../components/working-phrase.ts";
+import { icons } from "../../../components/icons.ts";
+import { currentThemeBranding } from "../../../components/neutral-mark.ts";
 import { i18n, t } from "../../../i18n/index.ts";
 import type { ChatItem } from "../../../lib/chat/chat-types.ts";
 import { formatCompactTokenCount } from "../../../lib/format.ts";
 import type { TurnRecap } from "../chat-progress.ts";
-import type { ChatRunStartupPhase } from "../chat-run-startup.ts";
+import type { ChatSubagentWait } from "../chat-subagent-wait.ts";
 import { selectWorkingClawSurprise } from "./chat-working-indicator-surprise.ts";
 
-// Almost every run uses the default loop; an alternate move fires once, then yields back to it.
-const STARTUP_STATUS_LABEL_KEYS = {
-  preparing_workspace: "chat.startupStatus.preparingWorkspace",
-  provisioning_environment: "chat.startupStatus.provisioningEnvironment",
-  preparing_context: "chat.startupStatus.preparingContext",
-  starting_model: "chat.startupStatus.startingModel",
-} as const satisfies Record<ChatRunStartupPhase, Parameters<typeof t>[0]>;
 const TURN_RECAP_DURATION_UNITS = [
   { seconds: 86_400, unit: "day" },
   { seconds: 3_600, unit: "hour" },
   { seconds: 60, unit: "minute" },
   { seconds: 1, unit: "second" },
 ] as const;
-
-function startupStatusLabel(phase: ChatRunStartupPhase): string {
-  return t(STARTUP_STATUS_LABEL_KEYS[phase]);
-}
 
 function formatTurnRecapDuration(ms: number): string {
   let remainingSeconds = Math.max(1, Math.round(ms / 1_000));
@@ -51,84 +42,119 @@ function formatTurnRecapDuration(ms: number): string {
   return new Intl.ListFormat(locale, { style: "long", type: "unit" }).format(parts);
 }
 
-function renderLiveOutputTokens(outputTokens: number | null | undefined) {
-  if (outputTokens === null || outputTokens === undefined) {
-    return nothing;
-  }
-  return html`
-    <span aria-hidden="true">·</span>
-    <span class="chat-working-indicator__tokens">
-      ${t("chat.outputTokens", { count: formatCompactTokenCount(outputTokens) })}
-    </span>
-  `;
+// 0 is valid; only null/undefined means "unknown".
+function outputTokensLabel(outputTokens: number): string {
+  return outputTokens === 1
+    ? t("chat.turnRecap.tokensOne")
+    : t("chat.turnRecap.tokens", { count: formatCompactTokenCount(outputTokens) });
 }
 
 export function renderChatWorkingIndicator(
-  part: Extract<ChatItem, { kind: "reading-indicator" }>,
+  part: Omit<Extract<ChatItem, { kind: "reading-indicator" }>, "startedAt"> & {
+    startedAt: number | null;
+  },
   options: {
+    mascot?: ThemeMascot;
+    workingPhrases?: readonly string[];
     waitingApproval?: boolean;
-    startupPhase?: ChatRunStartupPhase;
+    waitingSubagents?: ChatSubagentWait;
+    onOpenSession?: (key: string) => void;
+    startupLabel?: string;
     outputTokens?: number | null;
     presentation?: "standalone" | "continuation";
   } = {},
 ) {
   const waitingApproval = options.waitingApproval === true;
+  const waitingSubagents = options.waitingSubagents;
+  const child = waitingSubagents?.child;
+  const neutral = (options.mascot ?? currentThemeBranding().mascot) === "none";
   const continuation = options.presentation === "continuation";
+  const statusLabel = waitingSubagents
+    ? t("chat.waitingOnSubagents")
+    : waitingApproval
+      ? t("chat.waitingForApproval")
+      : options.startupLabel || t("common.working");
+  const working = !waitingSubagents && !waitingApproval && !options.startupLabel;
+  // Providers report exact usage at response boundaries, not per text delta.
+  // Keep the latest count visible while the run continues through tools.
+  const outputTokens = waitingSubagents ? null : options.outputTokens;
   // The animated claw stays decorative; the text status exposes progress without
   // announcing every elapsed-time tick to screen readers.
   return html`
     <div
-      class="chat-working-indicator ${continuation ? "chat-working-indicator--continuation" : ""}"
+      class="chat-working-indicator ${continuation ? "chat-working-indicator--continuation" : ""} ${waitingSubagents ? "chat-working-indicator--subagents" : ""}"
       role="status"
       aria-live="off"
     >
-      ${continuation
-        ? nothing
-        : html`
-            <div
-              class="chat-bubble chat-reading-indicator ${selectWorkingClawSurprise(part.key, {
-                eligible: !waitingApproval,
-              })}"
-              aria-hidden="true"
-            >
-              ${icons.claw}
-            </div>
-          `}
+      ${
+        continuation
+          ? nothing
+          : html`
+              <div
+                class="chat-bubble chat-reading-indicator ${
+                  neutral
+                    ? "chat-reading-indicator--neutral"
+                    : selectWorkingClawSurprise(part.key, {
+                        eligible: !waitingApproval && !waitingSubagents,
+                      })
+                }"
+                aria-hidden="true"
+              >
+                ${neutral ? html`<span></span><span></span><span></span>` : icons.claw}
+              </div>
+            `
+      }
       <span class="chat-working-indicator__status">
-        ${waitingApproval
-          ? html`<span>${t("chat.waitingForApproval")}</span>`
-          : options.startupPhase
-            ? html`
-                <span>${startupStatusLabel(options.startupPhase)}</span>
-                <openclaw-elapsed-time
-                  class="chat-working-indicator__elapsed"
-                  .startMs=${part.startedAt}
-                ></openclaw-elapsed-time>
-                ${renderLiveOutputTokens(options.outputTokens)}
-              `
+        <span class=${working && !continuation ? "sr-only" : ""}>${statusLabel}</span>
+        ${
+          child && options.onOpenSession
+            ? html`<button
+                class="chat-working-indicator__child"
+                type="button"
+                title=${child.label}
+                @click=${() => options.onOpenSession?.(child.key)}
+              >
+                ${child.label}
+              </button>`
+            : nothing
+        }
+        ${
+          waitingApproval || part.startedAt === null
+            ? nothing
             : html`
-                <span class=${continuation ? "" : "agent-chat__sr-only"}
-                  >${t("common.working")}</span
-                >
                 <openclaw-elapsed-time
                   class="chat-working-indicator__elapsed"
                   .startMs=${part.startedAt}
                 ></openclaw-elapsed-time>
-                <openclaw-working-phrase
-                  aria-hidden="true"
-                  .startMs=${part.startedAt}
-                  .seed=${part.key}
-                ></openclaw-working-phrase>
-                ${renderLiveOutputTokens(options.outputTokens)}
-              `}
+              `
+        }
+        ${
+          outputTokens !== null && outputTokens !== undefined
+            ? html`
+                <span aria-hidden="true">·</span>
+                <span class="chat-working-indicator__tokens"
+                  >${outputTokensLabel(outputTokens)}</span
+                >
+              `
+            : working
+              ? html`
+                  <openclaw-working-phrase
+                    aria-hidden="true"
+                    .startMs=${part.startedAt}
+                    .seed=${part.key}
+                    .phrases=${options.workingPhrases}
+                  ></openclaw-working-phrase>
+                `
+              : nothing
+        }
       </span>
     </div>
   `;
 }
 
 /** Post-turn recap row: once the run settles, the parked claw reports how
- * long the turn took (and its output tokens when the terminal patch carried
- * them). Sticky until the next run replaces it. */
+ * long the turn took and its latest known output usage. Sticky until the
+ * next run replaces it. */
 export function renderTurnRecapRow(
   recap: TurnRecap,
   options: { presentation?: "standalone" | "continuation" } = {},
@@ -136,30 +162,29 @@ export function renderTurnRecapRow(
   const continuation = options.presentation === "continuation";
   // Sub-second turns still read as one second; terminal recaps favor full words.
   const duration = formatTurnRecapDuration(recap.runtimeMs);
-  // 0 is a valid count (command-only turns); only null means "unknown".
   const tokens =
-    typeof recap.outputTokens === "number"
-      ? recap.outputTokens === 1
-        ? t("chat.turnRecap.tokensOne")
-        : t("chat.turnRecap.tokens", { count: formatCompactTokenCount(recap.outputTokens) })
-      : null;
+    typeof recap.outputTokens === "number" ? outputTokensLabel(recap.outputTokens) : null;
   return html`
     <div
-      class="chat-tasks-status chat-turn-recap ${continuation
-        ? "chat-turn-recap--continuation"
-        : ""}"
+      class="chat-turn-recap ${continuation ? "chat-turn-recap--continuation" : ""}"
       role="status"
     >
-      ${continuation
-        ? nothing
-        : html`<span class="chat-tasks-status__claw" aria-hidden="true">${icons.claw}</span>`}
+      ${
+        continuation
+          ? nothing
+          : html`<span class="chat-turn-recap__claw" aria-hidden="true"
+              >${currentThemeBranding().mascot === "none" ? icons.mark : icons.claw}</span
+            >`
+      }
       <span>${t("chat.turnRecap.doneIn", { duration })}</span>
-      ${tokens === null
-        ? nothing
-        : html`
-            <span class="chat-tasks-status__sep" aria-hidden="true">·</span>
-            <span>${tokens}</span>
-          `}
+      ${
+        tokens === null
+          ? nothing
+          : html`
+              <span class="chat-turn-recap__sep" aria-hidden="true">·</span>
+              <span>${tokens}</span>
+            `
+      }
     </div>
   `;
 }

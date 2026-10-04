@@ -1,15 +1,18 @@
-// Pure view for the Dreaming tab of the Memory settings page: the global
-// schedule/storage/phase knobs. The controller (context, config writes, agent
-// picker) lives in memory-dreaming-page.ts, mirroring memory.ts/memory-page.ts.
 import { asNullableRecord as asConfigRecord } from "@openclaw/normalization-core/record-coerce";
 import { html, nothing, type TemplateResult } from "lit";
+import { renderModelPicker } from "../../components/model-picker.ts";
+import { providerIdFromModelRef } from "../../components/provider-icon.ts";
 import {
+  renderSettingsDefaultDescription,
   renderSettingsRow,
   renderSettingsSection,
   renderSettingsSegmented,
   renderSettingsToggleRow,
 } from "../../components/settings-ui.ts";
 import { t } from "../../i18n/index.ts";
+import { registerSettingsEnglish } from "../../i18n/locales/en-settings.ts";
+
+registerSettingsEnglish();
 
 /** Manifest bounds for a numeric field; `count` is `{integer, minimum}`, `ratio` is `0..1`. */
 type DreamingNumberBounds = { integer: boolean; min: number; max?: number };
@@ -18,35 +21,27 @@ const COUNT_FROM_ZERO: DreamingNumberBounds = { integer: true, min: 0 };
 const COUNT_FROM_ONE: DreamingNumberBounds = { integer: true, min: 1 };
 const RATIO: DreamingNumberBounds = { integer: false, min: 0, max: 1 };
 
-type DreamingFieldSpec =
+type DreamingFieldSpec = {
+  path: readonly string[];
+  labelKey: string;
+  helpKey: string;
+} & (
   | {
       kind: "text";
-      path: readonly string[];
-      labelKey: string;
-      helpKey: string;
       placeholderKey?: string;
+      defaultValue?: string;
     }
   | {
       kind: "number";
-      path: readonly string[];
-      labelKey: string;
-      helpKey: string;
       bounds: DreamingNumberBounds;
+      defaultValue: number;
     }
   | {
       kind: "toggle";
-      path: readonly string[];
-      labelKey: string;
-      helpKey: string;
       /** Runtime value for an absent key; see resolveMemoryDreamingConfig. */
       fallback: boolean;
-    };
-
-type DreamingFieldGroup = {
-  titleKey: string;
-  descriptionKey: string;
-  fields: readonly DreamingFieldSpec[];
-};
+    }
+);
 
 // Mirrors the memory-core manifest configSchema/uiHints
 // (extensions/memory-core/openclaw.plugin.json). Everything here previously
@@ -59,27 +54,14 @@ type DreamingFieldGroup = {
 // key is not "off", so rendering `false` would report the opposite of what the
 // sweep actually does. Keep the two in sync.
 const DREAMING_SCHEDULE_FIELDS: readonly DreamingFieldSpec[] = [
-  {
+  ...["frequency", "timezone", "model"].map((key): DreamingFieldSpec => ({
     kind: "text",
-    path: ["frequency"],
-    labelKey: "memoryPage.dreaming.frequency.label",
-    helpKey: "memoryPage.dreaming.frequency.help",
-    placeholderKey: "memoryPage.dreaming.frequency.placeholder",
-  },
-  {
-    kind: "text",
-    path: ["timezone"],
-    labelKey: "memoryPage.dreaming.timezone.label",
-    helpKey: "memoryPage.dreaming.timezone.help",
-    placeholderKey: "memoryPage.dreaming.timezone.placeholder",
-  },
-  {
-    kind: "text",
-    path: ["model"],
-    labelKey: "memoryPage.dreaming.model.label",
-    helpKey: "memoryPage.dreaming.model.help",
-    placeholderKey: "memoryPage.dreaming.model.placeholder",
-  },
+    path: [key],
+    labelKey: `memoryPage.dreaming.${key}.label`,
+    helpKey: `memoryPage.dreaming.${key}.help`,
+    placeholderKey: `memoryPage.dreaming.${key}.placeholder`,
+    defaultValue: key === "frequency" ? "0 3 * * *" : undefined,
+  })),
   {
     kind: "toggle",
     path: ["verboseLogging"],
@@ -90,138 +72,30 @@ const DREAMING_SCHEDULE_FIELDS: readonly DreamingFieldSpec[] = [
   },
 ];
 
-const DREAMING_PHASE_GROUPS: readonly DreamingFieldGroup[] = [
-  {
-    titleKey: "memoryPage.dreaming.phases.light.title",
-    descriptionKey: "memoryPage.dreaming.phases.light.description",
-    fields: [
-      {
-        kind: "toggle",
-        path: ["phases", "light", "enabled"],
-        labelKey: "memoryPage.dreaming.phaseFields.enabled",
-        helpKey: "memoryPage.dreaming.phaseFields.enabledHelp",
-        fallback: true,
-      },
-      {
-        kind: "number",
-        path: ["phases", "light", "lookbackDays"],
-        labelKey: "memoryPage.dreaming.phaseFields.lookbackDays",
-        helpKey: "memoryPage.dreaming.phaseFields.lookbackDaysHelp",
-        bounds: COUNT_FROM_ZERO,
-      },
-      {
-        kind: "number",
-        path: ["phases", "light", "limit"],
-        labelKey: "memoryPage.dreaming.phaseFields.limit",
-        helpKey: "memoryPage.dreaming.phaseFields.limitHelp",
-        bounds: COUNT_FROM_ZERO,
-      },
-      {
-        kind: "number",
-        path: ["phases", "light", "dedupeSimilarity"],
-        labelKey: "memoryPage.dreaming.phaseFields.dedupeSimilarity",
-        helpKey: "memoryPage.dreaming.phaseFields.dedupeSimilarityHelp",
-        bounds: RATIO,
-      },
-    ],
-  },
-  {
-    titleKey: "memoryPage.dreaming.phases.deep.title",
-    descriptionKey: "memoryPage.dreaming.phases.deep.description",
-    fields: [
-      {
-        kind: "toggle",
-        path: ["phases", "deep", "enabled"],
-        labelKey: "memoryPage.dreaming.phaseFields.enabled",
-        helpKey: "memoryPage.dreaming.phaseFields.enabledHelp",
-        fallback: true,
-      },
-      {
-        kind: "number",
-        path: ["phases", "deep", "limit"],
-        labelKey: "memoryPage.dreaming.phaseFields.limit",
-        helpKey: "memoryPage.dreaming.phaseFields.limitHelp",
-        bounds: COUNT_FROM_ZERO,
-      },
-      {
-        kind: "number",
-        path: ["phases", "deep", "minScore"],
-        labelKey: "memoryPage.dreaming.phaseFields.minScore",
-        helpKey: "memoryPage.dreaming.phaseFields.minScoreHelp",
-        bounds: RATIO,
-      },
-      {
-        kind: "number",
-        path: ["phases", "deep", "minRecallCount"],
-        labelKey: "memoryPage.dreaming.phaseFields.minRecallCount",
-        helpKey: "memoryPage.dreaming.phaseFields.minRecallCountHelp",
-        bounds: COUNT_FROM_ZERO,
-      },
-      {
-        kind: "number",
-        path: ["phases", "deep", "minUniqueQueries"],
-        labelKey: "memoryPage.dreaming.phaseFields.minUniqueQueries",
-        helpKey: "memoryPage.dreaming.phaseFields.minUniqueQueriesHelp",
-        bounds: COUNT_FROM_ZERO,
-      },
-      {
-        kind: "number",
-        path: ["phases", "deep", "recencyHalfLifeDays"],
-        labelKey: "memoryPage.dreaming.phaseFields.recencyHalfLifeDays",
-        helpKey: "memoryPage.dreaming.phaseFields.recencyHalfLifeDaysHelp",
-        bounds: COUNT_FROM_ZERO,
-      },
-      {
-        kind: "number",
-        path: ["phases", "deep", "maxAgeDays"],
-        labelKey: "memoryPage.dreaming.phaseFields.maxAgeDays",
-        helpKey: "memoryPage.dreaming.phaseFields.maxAgeDaysHelp",
-        bounds: COUNT_FROM_ONE,
-      },
-      {
-        kind: "number",
-        path: ["phases", "deep", "maxPromotedSnippetTokens"],
-        labelKey: "memoryPage.dreaming.phaseFields.maxPromotedSnippetTokens",
-        helpKey: "memoryPage.dreaming.phaseFields.maxPromotedSnippetTokensHelp",
-        bounds: COUNT_FROM_ONE,
-      },
-    ],
-  },
-  {
-    titleKey: "memoryPage.dreaming.phases.rem.title",
-    descriptionKey: "memoryPage.dreaming.phases.rem.description",
-    fields: [
-      {
-        kind: "toggle",
-        path: ["phases", "rem", "enabled"],
-        labelKey: "memoryPage.dreaming.phaseFields.enabled",
-        helpKey: "memoryPage.dreaming.phaseFields.enabledHelp",
-        fallback: true,
-      },
-      {
-        kind: "number",
-        path: ["phases", "rem", "lookbackDays"],
-        labelKey: "memoryPage.dreaming.phaseFields.lookbackDays",
-        helpKey: "memoryPage.dreaming.phaseFields.lookbackDaysHelp",
-        bounds: COUNT_FROM_ZERO,
-      },
-      {
-        kind: "number",
-        path: ["phases", "rem", "limit"],
-        labelKey: "memoryPage.dreaming.phaseFields.limit",
-        helpKey: "memoryPage.dreaming.phaseFields.limitHelp",
-        bounds: COUNT_FROM_ZERO,
-      },
-      {
-        kind: "number",
-        path: ["phases", "rem", "minPatternStrength"],
-        labelKey: "memoryPage.dreaming.phaseFields.minPatternStrength",
-        helpKey: "memoryPage.dreaming.phaseFields.minPatternStrengthHelp",
-        bounds: RATIO,
-      },
-    ],
-  },
-];
+const DREAMING_PHASE_NUMBERS: Record<
+  string,
+  readonly [key: string, bounds: DreamingNumberBounds, defaultValue: number][]
+> = {
+  light: [
+    ["lookbackDays", COUNT_FROM_ZERO, 2],
+    ["limit", COUNT_FROM_ZERO, 100],
+    ["dedupeSimilarity", RATIO, 0.9],
+  ],
+  deep: [
+    ["limit", COUNT_FROM_ZERO, 10],
+    ["minScore", RATIO, 0.75],
+    ["minRecallCount", COUNT_FROM_ZERO, 3],
+    ["minUniqueQueries", COUNT_FROM_ZERO, 3],
+    ["recencyHalfLifeDays", COUNT_FROM_ZERO, 14],
+    ["maxAgeDays", COUNT_FROM_ONE, 30],
+    ["maxPromotedSnippetTokens", COUNT_FROM_ONE, 160],
+  ],
+  rem: [
+    ["lookbackDays", COUNT_FROM_ZERO, 7],
+    ["limit", COUNT_FROM_ZERO, 10],
+    ["minPatternStrength", RATIO, 0.75],
+  ],
+};
 
 const STORAGE_MODES = ["inline", "separate", "both"] as const;
 type StorageMode = (typeof STORAGE_MODES)[number];
@@ -232,26 +106,43 @@ const DEFAULT_STORAGE_MODE: StorageMode = "separate";
 type DreamingSettingsProps = {
   /** `plugins.entries.<slot owner>.config.dreaming`, or null when unset. */
   dreaming: Record<string, unknown> | null;
+  /** agents.defaults.userTimezone, which the runtime inherits when present. */
+  timezoneDefault: string | null;
+  disabled: boolean;
   onPatch: (path: readonly string[], value: unknown) => void;
 };
 
 function readAtPath(root: Record<string, unknown> | null, path: readonly string[]): unknown {
+  let value: unknown = root;
+  for (const key of path) {
+    value = asConfigRecord(value)?.[key];
+  }
+  return path.length ? value : undefined;
+}
+
+function hasAtPath(root: Record<string, unknown> | null, path: readonly string[]): boolean {
   let current: Record<string, unknown> | null = root;
   for (const [index, key] of path.entries()) {
-    if (!current) {
-      return undefined;
+    if (!current || !Object.hasOwn(current, key)) {
+      return false;
     }
-    const next = current[key];
     if (index === path.length - 1) {
-      return next;
+      return true;
     }
-    current = asConfigRecord(next);
+    current = asConfigRecord(current[key]);
   }
-  return undefined;
+  return false;
 }
 
 function normalizeStorageMode(value: unknown): StorageMode {
   return STORAGE_MODES.find((mode) => mode === value) ?? DEFAULT_STORAGE_MODE;
+}
+
+function resolveDreamingModelDefault(dreaming: Record<string, unknown> | null): string {
+  const model = readAtPath(dreaming, ["execution", "defaults", "model"]);
+  return typeof model === "string" && model.trim()
+    ? model.trim()
+    : t("memoryPage.dreaming.model.default");
 }
 
 /** Parses an edited number against its manifest bounds; null means "do not write". */
@@ -268,11 +159,26 @@ function parseDreamingNumber(raw: string, bounds: DreamingNumberBounds): number 
 
 function renderField(props: DreamingSettingsProps, spec: DreamingFieldSpec) {
   const value = readAtPath(props.dreaming, spec.path);
+  const overridden = hasAtPath(props.dreaming, spec.path);
+  const defaultValue =
+    spec.kind === "toggle"
+      ? spec.fallback
+        ? t("common.enabled")
+        : t("common.disabled")
+      : spec.kind === "number"
+        ? String(spec.defaultValue)
+        : spec.path[0] === "timezone"
+          ? (props.timezoneDefault ?? t("memoryPage.dreaming.timezone.default"))
+          : spec.path[0] === "model"
+            ? resolveDreamingModelDefault(props.dreaming)
+            : (spec.defaultValue ?? "");
+  const defaultDescription = renderSettingsDefaultDescription(defaultValue, overridden);
   if (spec.kind === "toggle") {
     return renderSettingsToggleRow({
       title: t(spec.labelKey),
-      description: t(spec.helpKey),
+      description: html`${t(spec.helpKey)} ${defaultDescription}`,
       checked: typeof value === "boolean" ? value : spec.fallback,
+      disabled: props.disabled,
       onChange: (checked) => props.onPatch(spec.path, checked),
     });
   }
@@ -285,9 +191,34 @@ function renderField(props: DreamingSettingsProps, spec: DreamingFieldSpec) {
         ? value
         : "";
   const bounds = spec.kind === "number" ? spec.bounds : null;
+  if (spec.kind === "text" && spec.path[0] === "model") {
+    const provider = providerIdFromModelRef(defaultValue);
+    return renderSettingsRow({
+      title: t(spec.labelKey),
+      description: html`${t(spec.helpKey)} ${defaultDescription}`,
+      control: renderModelPicker({
+        label: t(spec.labelKey),
+        value: text,
+        options: [
+          {
+            value: "",
+            label: defaultValue,
+            ...(provider ? { provider } : {}),
+          },
+        ],
+        disabled: props.disabled,
+        custom: {
+          label: t("cron.form.customModel"),
+          placeholder: spec.placeholderKey ? t(spec.placeholderKey) : "",
+          commit: "change",
+        },
+        onChange: (model) => props.onPatch(spec.path, model.trim() || undefined),
+      }),
+    });
+  }
   return renderSettingsRow({
     title: t(spec.labelKey),
-    description: t(spec.helpKey),
+    description: html`${t(spec.helpKey)} ${defaultDescription}`,
     control: html`
       <input
         class="settings-input"
@@ -297,8 +228,9 @@ function renderField(props: DreamingSettingsProps, spec: DreamingFieldSpec) {
         step=${bounds ? (bounds.integer ? "1" : "any") : nothing}
         spellcheck="false"
         aria-label=${t(spec.labelKey)}
+        ?disabled=${props.disabled}
         .value=${text}
-        placeholder=${spec.kind === "text" && spec.placeholderKey ? t(spec.placeholderKey) : ""}
+        placeholder=${defaultValue}
         @change=${(event: Event) => {
           const input = event.currentTarget as HTMLInputElement;
           const next = input.value.trim();
@@ -326,7 +258,12 @@ function renderField(props: DreamingSettingsProps, spec: DreamingFieldSpec) {
 
 /** The global dreaming knobs, editable only when the slot owner stores them. */
 export function renderDreamingSettings(props: DreamingSettingsProps): TemplateResult {
-  const storageMode = normalizeStorageMode(readAtPath(props.dreaming, ["storage", "mode"]));
+  const storageModeValue = readAtPath(props.dreaming, ["storage", "mode"]);
+  const storageMode = normalizeStorageMode(storageModeValue);
+  const storageDefaultDescription = renderSettingsDefaultDescription(
+    t("memoryPage.dreaming.storage.modes.separate"),
+    hasAtPath(props.dreaming, ["storage", "mode"]),
+  );
   return html`
     ${renderSettingsSection(
       {
@@ -343,7 +280,9 @@ export function renderDreamingSettings(props: DreamingSettingsProps): TemplateRe
       html`
         ${renderSettingsRow({
           title: t("memoryPage.dreaming.storage.modeLabel"),
-          description: t("memoryPage.dreaming.storage.modeHelp"),
+          description: html`
+            ${t("memoryPage.dreaming.storage.modeHelp")} ${storageDefaultDescription}
+          `,
           stacked: true,
           control: renderSettingsSegmented<StorageMode>({
             value: storageMode,
@@ -352,6 +291,7 @@ export function renderDreamingSettings(props: DreamingSettingsProps): TemplateRe
               label: t(`memoryPage.dreaming.storage.modes.${mode}`),
             })),
             ariaLabel: t("memoryPage.dreaming.storage.modeLabel"),
+            disabled: props.disabled,
             onChange: (mode) => props.onPatch(["storage", "mode"], mode),
           }),
         })}
@@ -365,10 +305,31 @@ export function renderDreamingSettings(props: DreamingSettingsProps): TemplateRe
         })}
       `,
     )}
-    ${DREAMING_PHASE_GROUPS.map((group) =>
+    ${Object.entries(DREAMING_PHASE_NUMBERS).map(([phase, fields]) =>
       renderSettingsSection(
-        { title: t(group.titleKey), description: t(group.descriptionKey) },
-        group.fields.map((spec) => renderField(props, spec)),
+        {
+          title: t(`memoryPage.dreaming.phases.${phase}.title`),
+          description: t(`memoryPage.dreaming.phases.${phase}.description`),
+        },
+        [
+          renderField(props, {
+            kind: "toggle",
+            path: ["phases", phase, "enabled"],
+            labelKey: "memoryPage.dreaming.phaseFields.enabled",
+            helpKey: "memoryPage.dreaming.phaseFields.enabledHelp",
+            fallback: true,
+          }),
+          ...fields.map(([key, bounds, defaultValue]) =>
+            renderField(props, {
+              kind: "number",
+              path: ["phases", phase, key],
+              labelKey: `memoryPage.dreaming.phaseFields.${key}`,
+              helpKey: `memoryPage.dreaming.phaseFields.${key}Help`,
+              bounds,
+              defaultValue,
+            }),
+          ),
+        ],
       ),
     )}
   `;

@@ -1,11 +1,10 @@
-// Mattermost plugin module owns monitor routing and delivery context helpers.
 import { resolveChannelStreamingPreviewToolProgress } from "openclaw/plugin-sdk/channel-outbound";
+import { resolveThreadSessionKeys } from "openclaw/plugin-sdk/routing";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { ResolvedMattermostAccount } from "./accounts.js";
-import { resolveThreadSessionKeys } from "./monitor-helpers.js";
 import type { MattermostEventPayload } from "./monitor-websocket.js";
 import {
   evaluateMattermostNoVisibleReply,
@@ -18,14 +17,13 @@ export function shouldUpdateMattermostDraftToolProgress(
   account: Pick<ResolvedMattermostAccount, "config" | "streamingMode">,
 ): boolean {
   return (
-    account.streamingMode !== "off" && resolveChannelStreamingPreviewToolProgress(account.config)
+    account.streamingMode !== "off" &&
+    resolveChannelStreamingPreviewToolProgress(
+      account.config,
+      account.streamingMode !== "progress",
+      account.streamingMode,
+    )
   );
-}
-
-export function shouldSuppressMattermostDefaultToolProgressMessages(
-  account: Pick<ResolvedMattermostAccount, "streamingMode">,
-): boolean {
-  return account.streamingMode !== "off";
 }
 
 export function buildMattermostModelPickerSelectMessageSid(params: {
@@ -36,6 +34,13 @@ export function buildMattermostModelPickerSelectMessageSid(params: {
   const provider = normalizeLowercaseStringOrEmpty(params.provider);
   const model = normalizeLowercaseStringOrEmpty(params.model);
   return `interaction:${params.postId}:select:${provider}/${model}`;
+}
+
+export function buildMattermostButtonInteractionMessageSid(params: {
+  postId: string;
+  actionId: string;
+}): string {
+  return `interaction:${params.postId}:${params.actionId}`;
 }
 
 export function resolveMattermostReplyRootId(params: {
@@ -53,6 +58,26 @@ export function resolveMattermostReplyRootId(params: {
     return threadRootId;
   }
   return normalizeOptionalString(params.replyToId);
+}
+
+export function resolveMattermostInteractionReplyRootId(params: {
+  kind: ChatType;
+  threadRootId?: string;
+  replyToId?: string;
+  interactionMessageSid: string;
+  sourcePostId: string;
+}): string | undefined {
+  const interactionMessageSid = normalizeOptionalString(params.interactionMessageSid);
+  const replyToId = normalizeOptionalString(params.replyToId);
+  // Interaction MessageSid values identify synthetic inbound events, not provider posts.
+  // Map only reply-to-current back to the source post or Mattermost rejects the root.
+  const providerReplyToId =
+    replyToId === interactionMessageSid ? normalizeOptionalString(params.sourcePostId) : replyToId;
+  return resolveMattermostReplyRootId({
+    kind: params.kind,
+    threadRootId: params.threadRootId,
+    replyToId: providerReplyToId,
+  });
 }
 
 export function canFinalizeMattermostPreviewInPlace(params: {
@@ -137,6 +162,7 @@ export function resolveMattermostThreadSessionContext(params: {
   const threadKeys = resolveThreadSessionKeys({
     baseSessionKey: params.baseSessionKey,
     threadId: effectiveReplyToId,
+    normalizeThreadId: (threadId) => threadId,
     // DM threads start fresh; room threads inherit their base session.
     parentSessionKey:
       effectiveReplyToId && params.kind !== "direct" ? params.baseSessionKey : undefined,
@@ -151,10 +177,11 @@ export function resolveMattermostThreadSessionContext(params: {
 export function resolveMattermostPendingHistoryKey(params: {
   kind: ChatType;
   sessionKey: string;
+  threadRootId?: string;
 }): string | null {
-  // DMs always dispatch immediately, so they do not need the pending-room
-  // history window. Keeping them out also avoids one empty bucket per DM thread.
-  return params.kind === "direct" ? null : params.sessionKey;
+  // Flat DMs dispatch immediately. Opted-in threads have an independent session
+  // and need a recoverable context window just like room threads.
+  return params.kind === "direct" && !params.threadRootId ? null : params.sessionKey;
 }
 
 export function resolveMattermostReactionChannelId(

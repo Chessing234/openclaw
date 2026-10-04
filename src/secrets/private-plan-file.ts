@@ -1,17 +1,16 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { resolveSystemBin } from "../infra/resolve-system-bin.js";
+import {
+  buildEncodedPowerShellArgs,
+  buildPowerShellFailureCause,
+  WINDOWS_POWERSHELL_COLD_SPAWN_TIMEOUT_MS,
+} from "../infra/windows-powershell-spawn.js";
 import { runExec } from "../process/exec.js";
 import {
   resolveTrustedPlanDirectoryPath,
   resolveTrustedWindowsSystemExecutablePath,
 } from "./trusted-plan-path.js";
-
-type WindowsPrivatePlanFileDependencies = {
-  resolveCompilerTempDir?: (env: NodeJS.ProcessEnv) => Promise<string>;
-  resolveTrustedExecutable?: (targetPath: string) => Promise<string>;
-  run?: typeof runExec;
-};
 
 const WINDOWS_PLAN_FILE_EXISTS_MARKER = "PRIVATE_PLAN_FILE_EXISTS";
 const WINDOWS_PRIVATE_PLAN_FILE_NATIVE_SOURCE = `
@@ -245,13 +244,7 @@ export async function createPrivateWindowsPlanFile(
   filePath: string,
   content: string,
   env: NodeJS.ProcessEnv = process.env,
-  dependencies: WindowsPrivatePlanFileDependencies = {},
 ): Promise<void> {
-  const resolveTrustedExecutable =
-    dependencies.resolveTrustedExecutable ?? resolveTrustedPowerShell;
-  const resolveCompilerTempDir =
-    dependencies.resolveCompilerTempDir ?? resolvePrivateWindowsCompilerTempDir;
-  const run = dependencies.run ?? runExec;
   const systemRoot =
     readWindowsEnv(env, "SYSTEMROOT") ?? readWindowsEnv(env, "WINDIR") ?? "C:\\Windows";
   if (!path.win32.isAbsolute(systemRoot)) {
@@ -289,8 +282,8 @@ export async function createPrivateWindowsPlanFile(
     "v1.0",
     "powershell.exe",
   );
-  const powershell = await resolveTrustedExecutable(powershellCandidate);
-  const compilerTempDir = await resolveCompilerTempDir(env);
+  const powershell = await resolveTrustedPowerShell(powershellCandidate);
+  const compilerTempDir = await resolvePrivateWindowsCompilerTempDir(env);
   const input = Buffer.from(
     JSON.stringify({
       content: Buffer.from(content, "utf8").toString("base64"),
@@ -301,35 +294,28 @@ export async function createPrivateWindowsPlanFile(
     "utf8",
   ).toString("base64");
   try {
-    await run(
-      powershell,
-      [
-        "-NoLogo",
-        "-NoProfile",
-        "-NonInteractive",
-        "-EncodedCommand",
-        Buffer.from(command, "utf16le").toString("base64"),
-      ],
-      {
-        baseEnv: {},
-        env: {
-          SYSTEMROOT: systemRoot,
-          TEMP: compilerTempDir,
-          TMP: compilerTempDir,
-          WINDIR: systemRoot,
-        },
-        input,
-        logOutput: false,
-        maxBuffer: 64 * 1024,
-        timeoutMs: 10_000,
+    await runExec(powershell, buildEncodedPowerShellArgs(command), {
+      baseEnv: {},
+      env: {
+        SYSTEMROOT: systemRoot,
+        TEMP: compilerTempDir,
+        TMP: compilerTempDir,
+        WINDIR: systemRoot,
       },
-    );
+      input,
+      logOutput: false,
+      maxBuffer: 64 * 1024,
+      timeoutMs: WINDOWS_POWERSHELL_COLD_SPAWN_TIMEOUT_MS,
+    });
   } catch (error) {
     if (String(error).includes(WINDOWS_PLAN_FILE_EXISTS_MARKER)) {
       const existsError = new Error(`Private plan file already exists: ${filePath}`);
       (existsError as NodeJS.ErrnoException).code = "EEXIST";
       throw existsError;
     }
-    throw new Error(`Unable to create private Windows plan file: ${filePath}`, { cause: error });
+    // oxlint-disable-next-line preserve-caught-error -- The raw error carries the -EncodedCommand argv; only the sanitized bounded diagnostic may escape.
+    throw new Error(`Unable to create private Windows plan file: ${filePath}`, {
+      cause: buildPowerShellFailureCause(error),
+    });
   }
 }

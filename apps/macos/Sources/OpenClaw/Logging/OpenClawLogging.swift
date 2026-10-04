@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 @_exported import Logging
 import os
@@ -9,7 +10,7 @@ enum AppLogSettings {
     static let logLevelKey = appLogLevelKey
 
     static func logLevel() -> Logger.Level {
-        if let raw = UserDefaults.standard.string(forKey: self.logLevelKey),
+        if let raw = AppDefaults.standard.string(forKey: self.logLevelKey),
            let level = Logger.Level(rawValue: raw)
         {
             return level
@@ -18,11 +19,7 @@ enum AppLogSettings {
     }
 
     static func setLogLevel(_ level: Logger.Level) {
-        UserDefaults.standard.set(level.rawValue, forKey: self.logLevelKey)
-    }
-
-    static func fileLoggingEnabled() -> Bool {
-        UserDefaults.standard.bool(forKey: debugFileLogEnabledKey)
+        AppDefaults.standard.set(level.rawValue, forKey: self.logLevelKey)
     }
 }
 
@@ -78,13 +75,39 @@ extension Logging.Logger {
     }
 }
 
-extension Logger.Message.StringInterpolation {
-    // periphery:ignore:parameters privacy - Call sites need OSLog syntax that swift-log otherwise cannot parse.
+enum AppLogPrivacy {
+    enum Mask {
+        case none, hash
+    }
+
+    case `public`
+    case `private`(mask: Mask)
+
+    static var `private`: Self {
+        .private(mask: .none)
+    }
+
+    /// Correlate within this process without persisting a key or exposing guessable identifiers.
+    fileprivate static let hashKey = SymmetricKey(size: .bits256)
+}
+
+/// swift-log uses DefaultStringInterpolation, including for concatenated String messages.
+/// Redact here: its Message stores only text, so neither sink can recover privacy afterward.
+extension DefaultStringInterpolation {
     mutating func appendInterpolation(
-        _ value: some Any,
-        privacy: OSLogPrivacy)
+        _ value: @autoclosure () -> some Any,
+        privacy: AppLogPrivacy)
     {
-        self.appendInterpolation(String(describing: value))
+        switch privacy {
+        case .public:
+            self.appendInterpolation(String(describing: value()))
+        case .private(mask: .none):
+            self.appendLiteral("<private>")
+        case .private(mask: .hash):
+            let bytes = Data(String(describing: value()).utf8)
+            let hash = HMAC<SHA256>.authenticationCode(for: bytes, using: AppLogPrivacy.hashKey)
+            self.appendLiteral("<private:\(Data(hash).base64EncodedString())>")
+        }
     }
 }
 
@@ -101,9 +124,7 @@ private func stringifyLogMetadataValue(_ value: Logger.Metadata.Value) -> String
     }
 }
 
-private protocol AppLogLevelBackedHandler: LogHandler {
-    var metadata: Logger.Metadata { get set }
-}
+private protocol AppLogLevelBackedHandler: LogHandler {}
 
 extension AppLogLevelBackedHandler {
     var logLevel: Logger.Level {
@@ -161,7 +182,7 @@ struct OpenClawFileLogHandler: AppLogLevelBackedHandler {
     var metadata: Logger.Metadata = [:]
 
     func log(event: LogEvent) {
-        guard AppLogSettings.fileLoggingEnabled() else { return }
+        guard DiagnosticsFileLog.isEnabled() else { return }
         let (subsystem, category) = OpenClawLogging.parseLabel(self.label)
         var fields: [String: String] = [
             "subsystem": subsystem,

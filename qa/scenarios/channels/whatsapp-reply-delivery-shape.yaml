@@ -11,8 +11,10 @@ scenario:
     timeoutMs: 120000
     retryCount: 1
     suiteIsolation: isolated
-    config: { whatsappScenarioId: whatsapp-reply-delivery-shape }
+    config:
+      whatsappScenario: whatsappQaReplyDeliveryShapeScenario
 flow:
   module: ./live-transports/whatsapp/scenario-runtime.js
-  call: runWhatsAppReplyDeliveryShapeScenario
-  args: [{ expr: whatsappScenarioContext }]
+  call: runWhatsAppScenario
+  args:
+    - { expr: whatsappScenarioContext }

@@ -9,6 +9,7 @@ import {
   isOpenClawStateDatabaseOpen,
 } from "../state/openclaw-state-db.js";
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
+import { assertOpenClawStateWriteAllowed } from "../state/openclaw-state-ownership.js";
 import {
   compactDoctorSqliteFile,
   type DoctorSqliteCompactSnapshot,
@@ -65,7 +66,8 @@ export async function runDoctorStateSqliteCompact(
     env,
     operation: "state SQLite compaction",
     protectedPaths: resolveSqliteDatabaseFilePaths(sqlitePath),
-    run: () => {
+    run: (authority) => {
+      authority.assertCurrent();
       if (isOpenClawStateDatabaseOpen()) {
         throw new Error(
           "The shared OpenClaw state database is already open in this process. Stop OpenClaw and retry.",
@@ -84,8 +86,11 @@ export async function runDoctorStateSqliteCompact(
         },
         ...(deps.busyTimeoutMs !== undefined ? { busyTimeoutMs: deps.busyTimeoutMs } : {}),
         sqlitePath,
-        validateBeforeMutation: (database) =>
-          assertOpenClawStateDatabaseForMaintenance(database, { pathname: sqlitePath }),
+        validateBeforeMutation: (database) => {
+          authority.assertCurrent();
+          assertOpenClawStateWriteAllowed({ database, databasePath: sqlitePath, env });
+          assertOpenClawStateDatabaseForMaintenance(database, { pathname: sqlitePath });
+        },
       });
       return {
         ...compact,

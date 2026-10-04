@@ -1,10 +1,10 @@
-// Discord plugin module implements probe behavior.
 import type { BaseProbeResult } from "openclaw/plugin-sdk/channel-contract";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { resolveFetch } from "openclaw/plugin-sdk/fetch-runtime";
 import { readResponseWithLimit } from "openclaw/plugin-sdk/response-limit-runtime";
 import { fetchWithTimeout, runChannelProbe } from "openclaw/plugin-sdk/text-utility-runtime";
 import { DiscordApiError, fetchDiscord } from "./api.js";
+import { getDiscordEndpointRuntime, type DiscordEndpointRuntime } from "./endpoint-runtime.js";
 import { normalizeDiscordToken } from "./token.js";
 
 const DISCORD_API_BASE = "https://discord.com/api/v10";
@@ -33,33 +33,17 @@ export type DiscordApplicationSummary = {
   intents?: DiscordPrivilegedIntentsSummary;
 };
 
+export type DiscordApplicationIdProbeResult =
+  | { kind: "resolved"; applicationId: string }
+  | { kind: "rejected"; status: 401 | 403; error: unknown }
+  | { kind: "unavailable"; status: number | null; error: unknown };
+
 const DISCORD_APP_FLAG_GATEWAY_PRESENCE = 1 << 12;
 const DISCORD_APP_FLAG_GATEWAY_PRESENCE_LIMITED = 1 << 13;
 const DISCORD_APP_FLAG_GATEWAY_GUILD_MEMBERS = 1 << 14;
 const DISCORD_APP_FLAG_GATEWAY_GUILD_MEMBERS_LIMITED = 1 << 15;
 const DISCORD_APP_FLAG_GATEWAY_MESSAGE_CONTENT = 1 << 18;
 const DISCORD_APP_FLAG_GATEWAY_MESSAGE_CONTENT_LIMITED = 1 << 19;
-
-async function fetchDiscordApplicationMe(
-  token: string,
-  timeoutMs: number,
-  fetcher: typeof fetch,
-): Promise<{ id?: string; flags?: number } | undefined> {
-  try {
-    const normalized = normalizeDiscordToken(token, "channels.discord.token");
-    if (!normalized) {
-      return undefined;
-    }
-    return await fetchDiscord<{ id?: string; flags?: number }>(
-      "/oauth2/applications/@me",
-      normalized,
-      fetcher,
-      { retry: { attempts: 1 }, timeoutMs },
-    );
-  } catch {
-    return undefined;
-  }
-}
 
 export function resolveDiscordPrivilegedIntentsFromFlags(
   flags: number,
@@ -90,8 +74,25 @@ export async function fetchDiscordApplicationSummary(
   token: string,
   timeoutMs: number,
   fetcher: typeof fetch = fetch,
+  endpointRuntime?: DiscordEndpointRuntime | null,
 ): Promise<DiscordApplicationSummary | undefined> {
-  const json = await fetchDiscordApplicationMe(token, timeoutMs, fetcher);
+  const retainedEndpoint =
+    endpointRuntime === undefined ? getDiscordEndpointRuntime() : endpointRuntime;
+  let json: { id?: string; flags?: number } | undefined;
+  try {
+    const normalized = normalizeDiscordToken(token, "channels.discord.token");
+    if (!normalized) {
+      return undefined;
+    }
+    json = await fetchDiscord<{ id?: string; flags?: number }>(
+      "/oauth2/applications/@me",
+      normalized,
+      fetcher,
+      { endpointRuntime: retainedEndpoint ?? null, retry: { attempts: 1 }, timeoutMs },
+    );
+  } catch {
+    return undefined;
+  }
   if (!json) {
     return undefined;
   }
@@ -146,7 +147,8 @@ export async function probeDiscord(
   return await runChannelProbe(
     undefined,
     async ({ startedAt }) => {
-      const fetcher = opts?.fetcher ?? fetch;
+      const endpoint = getDiscordEndpointRuntime();
+      const fetcher = endpoint?.fetch ?? opts?.fetcher ?? fetch;
       const includeApplication = opts?.includeApplication === true;
       const normalized = normalizeDiscordToken(token, "channels.discord.token");
       const result: Omit<DiscordProbe, "elapsedMs"> = {
@@ -159,7 +161,7 @@ export async function probeDiscord(
       }
       let res: Response | undefined;
       try {
-        const getMeUrl = `${DISCORD_API_BASE}/users/@me`;
+        const getMeUrl = `${endpoint?.descriptor.restApiBaseUrl ?? DISCORD_API_BASE}/users/@me`;
         const getMeDeadlineMs = Date.now() + timeoutMs;
         res = await fetchWithTimeout(
           getMeUrl,
@@ -187,8 +189,12 @@ export async function probeDiscord(
           const applicationTimeoutMs = Math.floor(timeoutMs - elapsedMs - completionReserveMs);
           if (applicationTimeoutMs > 0) {
             result.application =
-              (await fetchDiscordApplicationSummary(normalized, applicationTimeoutMs, fetcher)) ??
-              undefined;
+              (await fetchDiscordApplicationSummary(
+                normalized,
+                applicationTimeoutMs,
+                fetcher,
+                endpoint ?? null,
+              )) ?? undefined;
           }
         }
         return result;
@@ -206,14 +212,7 @@ export async function probeDiscord(
   );
 }
 
-/**
- * Extract the application (bot user) ID from a Discord bot token by
- * base64-decoding the first segment.  Discord tokens have the format:
- *   base64(user_id) . timestamp . hmac
- * The decoded first segment is the numeric snowflake ID as a plain string,
- * so we keep it as a string to avoid precision loss for IDs that exceed
- * Number.MAX_SAFE_INTEGER.
- */
+// Tokens start with base64(user_id). Keep snowflakes as strings to avoid precision loss.
 export function parseApplicationIdFromToken(token: string): string | undefined {
   const normalized = normalizeDiscordToken(token, "channels.discord.token");
   if (!normalized) {
@@ -225,12 +224,50 @@ export function parseApplicationIdFromToken(token: string): string | undefined {
   }
   try {
     const decoded = Buffer.from(normalized.slice(0, firstDot), "base64").toString("utf-8");
-    if (/^\d+$/.test(decoded)) {
-      return decoded;
-    }
-    return undefined;
+    return /^\d+$/.test(decoded) ? decoded : undefined;
   } catch {
     return undefined;
+  }
+}
+
+export async function probeDiscordApplicationId(
+  token: string,
+  timeoutMs: number,
+  fetcher: typeof fetch = fetch,
+): Promise<DiscordApplicationIdProbeResult> {
+  const normalized = normalizeDiscordToken(token, "channels.discord.token");
+  if (!normalized) {
+    return { kind: "unavailable", status: null, error: new Error("missing token") };
+  }
+  const parsedApplicationId = parseApplicationIdFromToken(token);
+  if (parsedApplicationId) {
+    return { kind: "resolved", applicationId: parsedApplicationId };
+  }
+  try {
+    const endpoint = getDiscordEndpointRuntime();
+    const json = await fetchDiscord<{ id?: string }>(
+      "/oauth2/applications/@me",
+      normalized,
+      endpoint?.fetch ?? fetcher,
+      { timeoutMs },
+    );
+    if (json?.id) {
+      return { kind: "resolved", applicationId: json.id };
+    }
+    return {
+      kind: "unavailable",
+      status: null,
+      error: new Error("Discord application response did not include an id"),
+    };
+  } catch (error) {
+    if (error instanceof DiscordApiError && (error.status === 401 || error.status === 403)) {
+      return { kind: "rejected", status: error.status, error };
+    }
+    return {
+      kind: "unavailable",
+      status: error instanceof DiscordApiError ? error.status : null,
+      error,
+    };
   }
 }
 
@@ -239,32 +276,12 @@ export async function fetchDiscordApplicationId(
   timeoutMs: number,
   fetcher: typeof fetch = fetch,
 ): Promise<string | undefined> {
-  const normalized = normalizeDiscordToken(token, "channels.discord.token");
-  if (!normalized) {
-    return undefined;
+  const result = await probeDiscordApplicationId(token, timeoutMs, fetcher);
+  if (result.kind === "resolved") {
+    return result.applicationId;
   }
-  const parsedApplicationId = parseApplicationIdFromToken(token);
-  if (parsedApplicationId) {
-    return parsedApplicationId;
+  if (result.kind === "unavailable" && result.status === 429) {
+    throw result.error;
   }
-  try {
-    const json = await fetchDiscord<{ id?: string }>(
-      "/oauth2/applications/@me",
-      normalized,
-      fetcher,
-      { timeoutMs },
-    );
-    if (json?.id) {
-      return json.id;
-    }
-    return undefined;
-  } catch (error) {
-    if (error instanceof DiscordApiError) {
-      if (error.status === 429) {
-        throw error;
-      }
-      return undefined;
-    }
-    return undefined;
-  }
+  return undefined;
 }
