@@ -1,3 +1,4 @@
+import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { formatErrorMessage } from "./errors.js";
 import { type RetryConfig, type RetryOptions, resolveRetryConfig, retryAsync } from "./retry.js";
@@ -34,27 +35,22 @@ function resolveChannelApiShouldRetry(params: {
 }
 
 function getChannelApiRetryAfterMs(err: unknown): number | undefined {
-  if (!err || typeof err !== "object") {
+  const record = asOptionalRecord(err);
+  if (!record) {
     return undefined;
   }
-  const candidate =
-    // Telegram-style clients may expose retry_after on the root error, response,
-    // or nested error object; keep all shapes aligned so rate-limit sleeps match.
-    "parameters" in err && err.parameters && typeof err.parameters === "object"
-      ? (err.parameters as { retry_after?: unknown }).retry_after
-      : "response" in err &&
-          err.response &&
-          typeof err.response === "object" &&
-          "parameters" in err.response
-        ? (
-            err.response as {
-              parameters?: { retry_after?: unknown };
-            }
-          ).parameters?.retry_after
-        : "error" in err && err.error && typeof err.error === "object" && "parameters" in err.error
-          ? (err.error as { parameters?: { retry_after?: unknown } }).parameters?.retry_after
-          : undefined;
-  return typeof candidate === "number" && Number.isFinite(candidate) ? candidate * 1000 : undefined;
+  // Check each supported wrapper until it supplies a valid rate-limit delay.
+  for (const candidate of [
+    record,
+    asOptionalRecord(record.response),
+    asOptionalRecord(record.error),
+  ]) {
+    const retryAfter = asOptionalRecord(candidate?.parameters)?.retry_after;
+    if (typeof retryAfter === "number" && Number.isFinite(retryAfter)) {
+      return retryAfter * 1000;
+    }
+  }
+  return undefined;
 }
 
 /** Creates the channel API retry runner used by outbound messaging integrations. */
