@@ -58,7 +58,7 @@ describe("transcript-tools", () => {
   });
 
   describe("countToolResults", () => {
-    it("counts tool_result blocks and tool_result_error blocks; tracks errors via is_error", () => {
+    it("counts tool_result blocks and tool_result_error blocks; tracks explicit errors", () => {
       expect(
         countToolResults({
           content: [
@@ -68,7 +68,7 @@ describe("transcript-tools", () => {
             { type: "text", text: "ignore" },
           ],
         }),
-      ).toEqual({ total: 3, errors: 1 });
+      ).toEqual({ total: 3, errors: 2 });
     });
 
     it("handles non-array content", () => {

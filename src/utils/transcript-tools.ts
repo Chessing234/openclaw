@@ -9,7 +9,12 @@ type ToolResultCounts = {
   errors: number;
 };
 
-const TOOL_RESULT_TYPES = new Set(["tool_result", "tool_result_error"]);
+const TOOL_RESULT_TYPES = new Set([
+  "toolresult",
+  "tool_result",
+  "tool_result_error",
+  "function_call_output",
+]);
 
 /** Preserves call occurrences; a top-level legacy name can mirror the first matching block. */
 export const extractToolCallNames = (message: Record<string, unknown>): string[] => {
@@ -60,7 +65,7 @@ export const countToolResults = (message: Record<string, unknown>): ToolResultCo
       continue;
     }
     total += 1;
-    if (block.is_error === true) {
+    if (type === "tool_result_error" || block.isError === true || block.is_error === true) {
       errors += 1;
     }
   }
