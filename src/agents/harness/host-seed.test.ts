@@ -18,6 +18,7 @@ import { createUserTurnTranscriptRecorder } from "../../sessions/user-turn-trans
 import type { PersistedUserTurnMessage } from "../../sessions/user-turn-transcript.types.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { compactEmbeddedAgentSessionDirect } from "../embedded-agent-runner/compact.js";
+import { log } from "../embedded-agent-runner/logger.js";
 import { readCompactionAccountingRecorder } from "../embedded-agent-runner/run/compaction-accounting-bridge.js";
 import {
   estimateCompactionHistoryTokens,
@@ -380,6 +381,51 @@ it.each([1, 2])(
         await expect(prepare({ assertCurrent: () => {} })).rejects.toThrow("seed source closed");
         expect(restore).toHaveBeenCalledTimes(calls);
       }
+    });
+  },
+);
+
+it.each(["throws", "rejects"] as const)(
+  "returns the bounded seed when the context observer %s",
+  async (failure) => {
+    await withOpenClawTestState({ label: "native-seed-observer" }, async (state) => {
+      setRuntimeConfigSnapshot({});
+      const target = seedTarget(state.statePath("sessions.sqlite"), "observer");
+      await upsertSessionEntryCore(target, { sessionId: target.sessionId, updatedAt: 1 });
+      const manager = await SessionManager.openAsync(target, state.workspaceDir);
+      await manager.appendMessageAsync(makeUserMessage("old".repeat(8000), 1));
+      const recorder = createUserTurnTranscriptRecorder({
+        message: { ...makeUserMessage("pending", 2), idempotencyKey: "observer:pending" },
+        target: { ...target, sessionEntry: loadSessionEntry(target), cwd: state.workspaceDir },
+      });
+      await recorder.persistApproved();
+      const warn = vi.spyOn(log, "warn").mockImplementation(() => undefined);
+      const prepare = expectDefined(
+        bindBoundedSeed(
+          {
+            sessionTarget: target,
+            workspaceDir: state.workspaceDir,
+            config: {
+              agents: {
+                defaults: { compaction: { enabled: false, maxActiveTranscriptBytes: 1024 } },
+              },
+            },
+            userTurnTranscriptRecorder: recorder,
+            onAgentEvent: () => {
+              if (failure === "throws") {
+                throw new Error("observer down");
+              }
+              return Promise.reject(new Error("observer down"));
+            },
+          },
+          () => {},
+          async (run) => run(),
+        )?.prepareBoundedSeed,
+        "seed capability",
+      );
+      const seed = await prepare({ assertCurrent: () => {} });
+      expect(JSON.stringify(seed)).toContain("Older history outside that window is omitted");
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("observer down"));
     });
   },
 );
