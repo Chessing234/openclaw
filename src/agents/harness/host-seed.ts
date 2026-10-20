@@ -11,8 +11,8 @@ import {
 } from "../../context-engine/transcript-byte-limit.js";
 import type { ContextEngineRuntimeContext } from "../../context-engine/types.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../defaults.js";
-import { log } from "../embedded-agent-runner/logger.js";
 import { requireCompactionWriterEntry } from "../embedded-agent-runner/compaction-successor.js";
+import { log } from "../embedded-agent-runner/logger.js";
 import { attachCompactionAccountingRecorder } from "../embedded-agent-runner/run/compaction-accounting-bridge.js";
 import type { EmbeddedRunAttemptInternalParams } from "../embedded-agent-runner/run/internal-params.js";
 import { normalizeContextTokenBudget } from "../embedded-agent-runner/utils.js";
