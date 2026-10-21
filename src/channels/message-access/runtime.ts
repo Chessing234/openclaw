@@ -3,6 +3,7 @@ import {
   uniqueStrings,
 } from "@openclaw/normalization-core/string-normalization";
 import { prepareCommandOwnerAuthority } from "../../auto-reply/command-auth.js";
+import { wrapCurrentPluginInstance } from "../../plugins/plugin-instance-scope.js";
 import { DEFAULT_ACCOUNT_ID } from "../../routing/account-id.js";
 import { prepareUserChannelIdentityAuthority } from "../../state/user-channel-identity-operations.js";
 import { recordChannelIngressResolution } from "./admission-evidence.js";
@@ -76,6 +77,7 @@ function createChannelIngressResolverForOwner(
         subject: input.subject,
         conversation: input.conversation,
         contextBinding: input.contextBinding,
+        childSessionPublication: input.childSessionPublication,
         event: {
           kind: event.kind ?? "message",
           authMode: event.authMode ?? "inbound",
@@ -438,16 +440,18 @@ async function resolveChannelMessageIngressForOwner(
             id: senderId!,
           },
       binding: participantBinding,
+      // Tools run later, often inside the provider plugin's stream consumer.
+      // Retained channel callbacks must re-enter their own plugin instance.
+      childSessionPublication: wrapCurrentPluginInstance(params.childSessionPublication),
       verifiedPrincipal,
-      requesterProfile:
-        requester && ownerIsCurrent()
-          ? {
-              id: requester.linked.profileId,
-              displayName: requester.linked.displayName,
-              isCurrent: requester.isCurrent,
-            }
-          : undefined,
-      commandOwnerAuthority: ownerIsCurrent() ? commandOwnerAuthority : undefined,
+      requesterProfile: requester
+        ? {
+            id: requester.linked.profileId,
+            displayName: requester.linked.displayName,
+            isCurrent: requester.isCurrent,
+          }
+        : undefined,
+      commandOwnerAuthority,
       promptedAt,
       owner: participantOwner,
       gatewayContext: participantGatewayContext,

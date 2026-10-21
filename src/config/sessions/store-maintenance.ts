@@ -7,16 +7,20 @@ import { parseDurationMs } from "../../cli/parse-duration.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { parseSessionDeliveryRoute } from "../../routing/session-key.js";
 import {
-  isAcpSessionKey,
-  isCronSessionKey,
-  isSubagentSessionKey,
   parseAgentSessionKey,
   parseThreadSessionSuffix,
 } from "../../sessions/session-key-utils.js";
 import { sessionDeliveryOrigin } from "../../utils/delivery-context.read.js";
 import type { SessionMaintenanceConfig, SessionMaintenanceMode } from "../types.base.js";
+import { hasMainSessionRecoveryClaim } from "./restart-recovery-state.js";
 import { isPinnableSessionEntry } from "./session-pin-policy.js";
-import type { SessionEntry } from "./types.js";
+import {
+  getSessionMaintenanceActivityAt,
+  isGatewayModelRunSessionKey,
+  isRecentSessionMaintenanceEntry,
+  isSyntheticSessionMaintenanceKey,
+} from "./store-maintenance-activity.js";
+import type { InternalSessionEntry as SessionEntry } from "./types.js";
 
 const log = createSubsystemLogger("sessions/store");
 
@@ -209,12 +213,6 @@ export function shouldRunModelRunPrune(params: {
   });
 }
 
-function isGatewayModelRunSessionKey(sessionKey: string): boolean {
-  return /^agent:([^:\s]+):explicit:model-run-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
-    sessionKey,
-  );
-}
-
 /**
  * Archive stale durable entries in place; remove only disposable runtime entries.
  * Entries without `updatedAt` are kept (cannot determine staleness).
@@ -225,6 +223,7 @@ export function pruneStaleEntries(
   overrideMaxAgeMs?: number,
   opts: {
     log?: boolean;
+    nowMs?: number;
     onPruned?: (params: { key: string; entry: SessionEntry }) => void;
     onArchived?: (params: { key: string; entry: SessionEntry }) => void;
     preserveKeys?: ReadonlySet<string>;
@@ -235,7 +234,7 @@ export function pruneStaleEntries(
   if (maxAgeMs <= 0) {
     return 0;
   }
-  const now = Date.now();
+  const now = opts.nowMs ?? Date.now();
   const cutoffMs = now - maxAgeMs;
   let pruned = 0;
   for (const [key, entry] of Object.entries(store)) {
@@ -271,6 +270,7 @@ export function pruneStaleModelRunEntries(
   overrideMaxAgeMs?: number | null,
   opts: {
     log?: boolean;
+    nowMs?: number;
     onPruned?: (params: { key: string; entry: SessionEntry }) => void;
     preserveKeys?: ReadonlySet<string>;
     preserveRecentMs?: number | null;
@@ -279,7 +279,7 @@ export function pruneStaleModelRunEntries(
   if (overrideMaxAgeMs == null || overrideMaxAgeMs <= 0) {
     return 0;
   }
-  const cutoffMs = Date.now() - overrideMaxAgeMs;
+  const cutoffMs = (opts.nowMs ?? Date.now()) - overrideMaxAgeMs;
   let pruned = 0;
   for (const [key, entry] of Object.entries(store)) {
     if (shouldPreserveMaintenanceEntry({ key, entry, ...opts })) {
@@ -342,19 +342,6 @@ export function resolveQuotaSuspensionEntryMaintenance(params: {
   return { patch: null, cleared: false };
 }
 
-export function getSessionMaintenanceActivityAt(
-  entry:
-    | Pick<SessionEntry, "updatedAt" | "lastInteractionAt" | "lastActivityAt" | "sessionStartedAt">
-    | undefined,
-): number {
-  return Math.max(
-    entry?.lastInteractionAt ?? 0,
-    entry?.lastActivityAt ?? 0,
-    entry?.sessionStartedAt ?? 0,
-    entry?.updatedAt ?? 0,
-  );
-}
-
 /** Archive inactive dashboard sessions while retaining runtime-owned or explicitly active keys. */
 export function archiveStaleDashboardEntries(
   store: Record<string, SessionEntry>,
@@ -395,38 +382,6 @@ export function archiveStaleDashboardEntries(
     log.info("archived stale dashboard session entries", { archived, archiveAfterMs });
   }
   return archived;
-}
-
-function isSyntheticSessionMaintenanceKey(sessionKey: string): boolean {
-  const parsed = parseAgentSessionKey(sessionKey);
-  const rest = normalizeLowercaseStringOrEmpty(parsed?.rest ?? sessionKey);
-  // ACP bridge sessions use normal model dispatch, but remain synthetic and disposable.
-  return (
-    isGatewayModelRunSessionKey(sessionKey) ||
-    isSubagentSessionKey(sessionKey) ||
-    isAcpSessionKey(sessionKey) ||
-    isCronSessionKey(sessionKey) ||
-    rest.startsWith("acp-bridge:") ||
-    rest.startsWith("hook:") ||
-    rest.startsWith("node:") ||
-    rest === "heartbeat" ||
-    rest.endsWith(":heartbeat") ||
-    rest.includes(":heartbeat:")
-  );
-}
-
-export function isRecentSessionMaintenanceEntry(params: {
-  key: string;
-  entry: SessionEntry | undefined;
-  preserveRecentMs?: number | null;
-  nowMs?: number;
-}): boolean {
-  if (params.preserveRecentMs == null || isSyntheticSessionMaintenanceKey(params.key)) {
-    return false;
-  }
-  const activityAt = getSessionMaintenanceActivityAt(params.entry);
-  const now = params.nowMs ?? Date.now();
-  return activityAt > 0 && now - activityAt <= params.preserveRecentMs;
 }
 
 function isProtectedExternalConversationSessionKey(sessionKey: string): boolean {
@@ -480,6 +435,7 @@ type SessionMaintenanceEntryParams = {
   entry: SessionEntry | undefined;
   preserveKeys?: ReadonlySet<string>;
   preserveRecentMs?: number | null;
+  nowMs?: number;
 };
 
 function shouldPreserveNonArchivedMaintenanceEntry(params: SessionMaintenanceEntryParams): boolean {
@@ -491,8 +447,8 @@ function shouldPreserveNonArchivedMaintenanceEntry(params: SessionMaintenanceEnt
   // the same conversation under an incompatible model, so pressure may exceed
   // configured retention limits while the lock remains.
   return (
+    (hasMainSessionRecoveryClaim(params.entry) && !params.entry?.mainRestartRecovery?.tombstone) ||
     params.entry?.modelSelectionLocked === true ||
-    params.entry?.status === "running" ||
     params.preserveKeys?.has(params.key) === true ||
     isRecentSessionMaintenanceEntry(params) ||
     isProtectedSessionMaintenanceEntry(params.key, params.entry)
@@ -522,6 +478,7 @@ function selectSessionEntryCapVictims(
   maxEntries: number,
   preserveKeys?: ReadonlySet<string>,
   preserveRecentMs?: number | null,
+  nowMs?: number,
 ): string[] {
   const keys = Object.keys(store).filter((key) => store[key]?.archivedAt === undefined);
   const overflow = keys.length - Math.max(0, maxEntries);
@@ -539,6 +496,7 @@ function selectSessionEntryCapVictims(
         entry: store[key],
         preserveKeys,
         preserveRecentMs,
+        nowMs,
       }),
   );
   // Rank the whole eligible roster by its latest activity signal so the sessions untouched for
@@ -577,6 +535,7 @@ export function capEntryCount(
     maxEntries,
     opts.preserveKeys,
     opts.preserveRecentMs,
+    opts.nowMs,
   );
   if (victims.length === 0) {
     return 0;

@@ -28,7 +28,6 @@ const STREAMING_COMMENTARY_ITEM_KINDS = new Set([
   "reasoning",
 ]);
 
-/** Provider-specific reasoning lanes normalized into one ClickClack label. */
 const THINKING_ITEM_KINDS = new Set(["analysis", "thinking", "reasoning"]);
 
 function normalizedItemKind(payload: ClickClackItemEventPayload): string {
@@ -62,13 +61,7 @@ function activityBody(payload: ClickClackItemEventPayload): string {
   if (head && text) {
     return `**${head}**\n\n${text}`;
   }
-  if (text) {
-    return text;
-  }
-  if (head) {
-    return head;
-  }
-  return payload.status?.trim() || payload.kind?.trim() || "";
+  return text || head || payload.status?.trim() || payload.kind?.trim() || "";
 }
 
 type CommentarySegment = {
@@ -95,10 +88,8 @@ export function createClickClackActivityPublisher(params: {
   client: Pick<ClickClackClient, "createActivityMessage" | "updateMessageBody">;
   target: ClickClackActivityTarget;
   turnId: string;
-  flushMs?: number;
   onError?: (error: unknown) => void;
 }) {
-  const flushMs = params.flushMs ?? CLICKCLACK_COMMENTARY_FLUSH_MS;
   const commentaryByItem = new Map<string, CommentarySegment>();
   const toolRows = new Map<string, ToolRow>();
   let provenance: ClickClackMessageProvenance | undefined;
@@ -127,11 +118,9 @@ export function createClickClackActivityPublisher(params: {
     if (!segment) {
       return Promise.resolve();
     }
-    if (segment.timer) {
-      clearTimeout(segment.timer);
-      segment.timer = undefined;
-    }
-    if (!segment.dirty || !segment.body.trim()) {
+    clearTimeout(segment.timer);
+    segment.timer = undefined;
+    if (!segment.dirty || !segment.body) {
       return Promise.resolve();
     }
     segment.dirty = false;
@@ -155,7 +144,7 @@ export function createClickClackActivityPublisher(params: {
     const body = commentaryBody(payload);
     const key = payload.itemId?.trim() || "turn";
     let segment = commentaryByItem.get(key);
-    if (!body.trim()) {
+    if (!body) {
       if (segment) {
         clearTimeout(segment.timer);
         commentaryByItem.delete(key);
@@ -181,7 +170,7 @@ export function createClickClackActivityPublisher(params: {
       segment.timer = setTimeout(() => {
         segment.timer = undefined;
         void flushCommentary(key);
-      }, flushMs);
+      }, CLICKCLACK_COMMENTARY_FLUSH_MS);
     }
   };
 
@@ -211,9 +200,10 @@ export function createClickClackActivityPublisher(params: {
       void enqueue(async () => {
         // Late read is intentional: if the body was upgraded before this POST
         // ran, post the richer body directly and skip the follow-up PATCH.
-        const posted = await postRow(kind, row.body);
+        const submittedBody = row.body;
+        const posted = await postRow(kind, submittedBody);
         row.messageId = posted.id;
-        row.sentBody = row.body;
+        row.sentBody = submittedBody;
       });
       return;
     }
@@ -223,8 +213,9 @@ export function createClickClackActivityPublisher(params: {
     existing.body = body;
     void enqueue(async () => {
       if (existing.messageId && existing.body !== existing.sentBody) {
-        await params.client.updateMessageBody(existing.messageId, existing.body);
-        existing.sentBody = existing.body;
+        const submittedBody = existing.body;
+        await params.client.updateMessageBody(existing.messageId, submittedBody);
+        existing.sentBody = submittedBody;
       }
     });
   };
