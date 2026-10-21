@@ -1,5 +1,3 @@
-import { writeFile } from "node:fs/promises";
-import path from "node:path";
 import { text } from "node:stream/consumers";
 import { expect, it } from "vitest";
 import { startControlUiE2eServer } from "../test-helpers/control-ui-e2e.ts";
@@ -7,31 +5,35 @@ import { createControlUiSessionRow as sessionRow } from "../test-helpers/control
 import { createControlUiE2eSuite } from "./control-ui-e2e-suite.test-support.ts";
 import {
   activateSelfRemovingControl,
-  captureUiProof,
-  captureUiProofEnabled,
   controlUiSessionUrl,
   installMockGateway,
   openSessionMenuSubmenu,
   sessionsListResponse,
 } from "./session-management.test-support.ts";
+import { selectAllSidebarSessions } from "./sidebar-navigation.test-support.ts";
 
 const suite = createControlUiE2eSuite({
   name: "Control UI chat export attribution",
   startServer: () => startControlUiE2eServer(undefined, { source: true }),
 });
 const sessionKey = "agent:main:export-attribution";
+const toolCall = {
+  type: "toolCall",
+  id: "build-check",
+  name: "exec",
+  arguments: { command: "synthetic-check" },
+};
 const messages = [
+  { role: "user", content: "Please review the checklist.", __openclaw: { senderIsOwner: true } },
   { role: "user", senderLabel: "Alex", content: "I will write the release notes." },
   {
     role: "user",
     __openclaw: { senderName: "Sam", senderId: "sam@example.invalid" },
     content: "I will verify the build.",
   },
-  {
-    role: "assistant",
-    senderLabel: "Review assistant",
-    content: "Alex owns the notes; Sam owns build verification.",
-  },
+  { role: "assistant", content: [toolCall] },
+  { role: "toolResult", toolCallId: "build-check", content: "  Build verification passed.\n" },
+  { role: "assistant", senderLabel: "Review assistant", content: "Ready." },
 ];
 
 suite.define(() => {
@@ -41,9 +43,6 @@ suite.define(() => {
       await suite.withPage(
         {
           viewport: { width: 1280, height: 900 },
-          ...(captureUiProofEnabled
-            ? { recordVideo: { dir: suite.artifactDir, size: { width: 1280, height: 900 } } }
-            : {}),
         },
         async ({ context, page }) => {
           await context.grantPermissions(["clipboard-read", "clipboard-write"], {
@@ -53,6 +52,15 @@ suite.define(() => {
             sessionKey,
             featureMethods: ["chat.metadata", "chat.startup", "chat.history"],
             historyMessages: messages,
+            hasMultipleSessionSharingIdentities: true,
+            presenceUsers: [
+              {
+                id: action,
+                identity: { type: "profile", id: action },
+                name: action === "download" ? "Maya Chen" : "Jules Rivera",
+                self: true,
+              },
+            ],
             methodResponses: {
               "sessions.list": sessionsListResponse([
                 sessionRow(sessionKey, "Release planning", Date.parse("2026-08-15T06:00:00Z")),
@@ -63,11 +71,17 @@ suite.define(() => {
           await gateway.waitForRequest("chat.startup");
           const thread = page.locator(".chat-thread-inner");
           for (const sender of ["Alex", "Sam", "Review assistant"]) {
-            await thread.locator(".chat-sender-name").getByText(sender, { exact: true }).waitFor({
-              state: "visible",
-            });
+            await thread.locator(".chat-sender-name").getByText(sender, { exact: true }).waitFor();
           }
-          await captureUiProof(suite, page, `${action}-transcript.png`);
+          const unattributed = thread.locator(".chat-group.user").filter({
+            has: page.getByText("Please review the checklist.", { exact: true }),
+          });
+          expect(await unattributed.locator(".chat-sender-name").textContent()).toBe("Message");
+          expect(
+            await unattributed
+              .locator(".chat-avatar, .chat-author-avatar, a.chat-sender-name")
+              .count(),
+          ).toBe(0);
 
           let markdown: string;
           if (action === "download") {
@@ -82,11 +96,13 @@ suite.define(() => {
             }
             markdown = await text(stream);
           } else {
+            // Selecting All owners must not attribute this ownerless transcript to the viewer.
+            await selectAllSidebarSessions(page);
             const row = page.locator(`.sidebar-recent-session[data-session-key="${sessionKey}"]`);
             await row.hover();
-            await row.getByRole("button", { name: "Open session menu: Release planning" }).click();
-            await openSessionMenuSubmenu(page, "Copy");
-            await captureUiProof(suite, page, "copy-menu.png");
+            await row.click({ button: "right" });
+            await openSessionMenuSubmenu(page, "Advanced");
+            await openSessionMenuSubmenu(page, "Copy details");
             const copy = page.locator("openclaw-session-menu").getByRole("menuitem", {
               name: "Conversation as Markdown",
               exact: true,
@@ -97,17 +113,19 @@ suite.define(() => {
             markdown = await page.evaluate(() => navigator.clipboard.readText());
           }
           expect(await gateway.getRequests("chat.send")).toHaveLength(0);
-          if (captureUiProofEnabled) {
-            await writeFile(path.join(suite.artifactDir, `${action}.md`), markdown);
-            const preview = await context.newPage();
-            await preview.goto(`data:text/plain;charset=utf-8,${encodeURIComponent(markdown)}`);
-            await captureUiProof(suite, preview, `${action}-markdown.png`);
-            await preview.close();
-          }
-          expect(markdown.match(/^## .+$/gm)).toEqual(["## Alex", "## Sam", "## Review assistant"]);
+          expect(markdown.match(/^## .+$/gm)).toEqual([
+            "## Message",
+            "## Alex",
+            "## Sam",
+            "## Tool",
+            "## Review assistant",
+          ]);
           for (const message of messages) {
-            expect(markdown).toContain(message.content);
+            if (typeof message.content === "string") {
+              expect(markdown).toContain(message.content);
+            }
           }
+          expect(markdown).not.toContain("synthetic-check");
         },
       );
     },

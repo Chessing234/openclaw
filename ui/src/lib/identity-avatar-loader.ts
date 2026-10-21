@@ -1,4 +1,4 @@
-import { AVATAR_MAX_BYTES } from "../../../src/shared/avatar-limits.js";
+import { AVATAR_MAX_BYTES, isAvatarImageMimeType } from "../../../src/shared/avatar-limits.js";
 import {
   fetchGatewayContextResource,
   readAvatarGatewayContext,
@@ -9,25 +9,20 @@ import { resolveTrustedAvatarUrl } from "./identity-avatar.ts";
 const IDENTITY_AVATAR_CACHE_MAX_ENTRIES = 128;
 const IDENTITY_AVATAR_FETCH_TIMEOUT_MS = 30_000;
 const IDENTITY_AVATAR_FAILURE_TTL_MS = 60_000;
-// Agent identity files also support SVG; these blobs render only as <img>, never inline markup.
-const IDENTITY_AVATAR_MIME_TYPES = new Set([
-  "image/gif",
-  "image/jpeg",
-  "image/png",
-  "image/webp",
-  "image/svg+xml",
-]);
 
 type CachedIdentityAvatar = {
   blobUrl: string | null;
+  references: number;
   settled: boolean;
   retryAt?: number;
   promise: Promise<string | null>;
 };
 
 const identityAvatarCache = new Map<string, CachedIdentityAvatar>();
+let identityAvatarGeneration = 0;
 
 function clearIdentityAvatarCache(): void {
+  identityAvatarGeneration += 1;
   for (const entry of identityAvatarCache.values()) {
     if (entry.blobUrl) {
       URL.revokeObjectURL(entry.blobUrl);
@@ -47,7 +42,7 @@ function trimIdentityAvatarCache(): void {
     }
     // Pending consumers still need their eventual blob. Evict only settled
     // images or misses, in the Map's LRU order.
-    if (!entry.settled) {
+    if (!entry.settled || entry.references > 0) {
       continue;
     }
     identityAvatarCache.delete(key);
@@ -57,18 +52,19 @@ function trimIdentityAvatarCache(): void {
   }
 }
 
-function loadIdentityAvatar(url: string): string | Promise<string | null> {
+function loadIdentityAvatar(url: string): string | Promise<string | null> | null {
   const cached = identityAvatarCache.get(url);
   // Map order is the LRU order; concurrent roster, profile, and chat views
   // share the authenticated request and its result, including a cached miss.
   identityAvatarCache.delete(url);
   if (cached && (cached.retryAt === undefined || Date.now() < cached.retryAt)) {
     identityAvatarCache.set(url, cached);
-    return cached.settled && cached.blobUrl ? cached.blobUrl : cached.promise;
+    return cached.blobUrl ?? (cached.retryAt === undefined ? cached.promise : null);
   }
 
   const entry: CachedIdentityAvatar = {
     blobUrl: null,
+    references: 0,
     settled: false,
     promise: Promise.resolve(null),
   };
@@ -79,11 +75,7 @@ function loadIdentityAvatar(url: string): string | Promise<string | null> {
         return null;
       }
       const blob = await response.blob();
-      if (
-        blob.size === 0 ||
-        blob.size > AVATAR_MAX_BYTES ||
-        !IDENTITY_AVATAR_MIME_TYPES.has(blob.type.toLowerCase())
-      ) {
+      if (blob.size === 0 || blob.size > AVATAR_MAX_BYTES || !isAvatarImageMimeType(blob.type)) {
         return null;
       }
       const blobUrl = URL.createObjectURL(blob);
@@ -113,28 +105,152 @@ function loadIdentityAvatar(url: string): string | Promise<string | null> {
   return entry.promise;
 }
 
-/** Fetch connected-gateway profile images once and render CSP-safe blobs. */
-export function resolveAvatarImageUrl(value: string): string | Promise<string | null> | null {
+/** Cache managed images and misses; caller-owned sources bypass the loader. */
+export function resolveAvatarImageUrl(
+  value: string,
+  unmanagedUrl: string | null = null,
+): string | Promise<string | null> | null {
   const { authTokens, origin, resourceBasePath } = readAvatarGatewayContext();
   const trusted = resolveTrustedAvatarUrl(value, origin, resourceBasePath);
   if (!trusted) {
-    return null;
+    return unmanagedUrl;
   }
   // Connected same-origin routes need the loader too: it resolves a missing
   // avatar before Lit can reconcile an <img> error back over its initials.
   return origin || authTokens.length ? loadIdentityAvatar(trusted) : trusted;
 }
 
-/** A blob stays live until its image has finished loading or definitively failed. */
-export function settleAvatarImageUrl(value: string | null): void {
-  if (!value?.startsWith("blob:")) {
-    return;
+/** Acquire before awaiting: each pending or displayed consumer owns its own release. */
+export function retainAvatarImageUrl(value: string | Promise<string | null> | null): () => void {
+  const entry = value
+    ? [...identityAvatarCache.values()].find(
+        (item) => item.blobUrl === value || item.promise === value,
+      )
+    : undefined;
+  if (!entry) {
+    return () => undefined;
   }
-  for (const entry of identityAvatarCache.values()) {
-    if (entry.blobUrl === value) {
-      entry.settled = true;
-      trimIdentityAvatarCache();
+  entry.references += 1;
+  let released = false;
+  return () => {
+    if (released) {
       return;
     }
-  }
+    released = true;
+    entry.references -= 1;
+    entry.settled = true;
+    trimIdentityAvatarCache();
+  };
 }
+
+/** Synchronous view leases; the shared Gateway cache owns image bytes. */
+export function createIdentityAvatars() {
+  const listeners = new Set<() => void>();
+  const notify = () => listeners.forEach((listener) => listener());
+  let connected = false;
+  let unsubscribeGatewayReset: (() => void) | undefined;
+  const routes = new Map<
+    string,
+    { url: string | null; result: string | Promise<string | null> | null; release?: () => void }
+  >();
+  let activeRoutes: Set<string> | null = null;
+  let generation = identityAvatarGeneration;
+  function clearRoutes() {
+    for (const route of routes.values()) {
+      route.release?.();
+    }
+    routes.clear();
+  }
+  function disconnect() {
+    connected = false;
+    unsubscribeGatewayReset?.();
+    unsubscribeGatewayReset = undefined;
+    clearRoutes();
+  }
+  return {
+    connect() {
+      connected = true;
+      unsubscribeGatewayReset = registerAvatarGatewayReset(notify);
+      notify();
+      return disconnect;
+    },
+    disconnect,
+    subscribe(listener: () => void) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    withActiveRoutes<T>(render: () => T): T {
+      activeRoutes = new Set();
+      try {
+        return render();
+      } finally {
+        for (const [key, route] of routes) {
+          if (!activeRoutes.has(key)) {
+            route.release?.();
+            routes.delete(key);
+          }
+        }
+        activeRoutes = null;
+      }
+    },
+    imageErrorHandler(value: string): () => void {
+      const route = routes.get(value);
+      return () => {
+        // An old image may fail after its view or Gateway context was replaced.
+        if (
+          !route?.url ||
+          !connected ||
+          generation !== identityAvatarGeneration ||
+          routes.get(value) !== route
+        ) {
+          return;
+        }
+        route.url = null;
+        notify();
+      };
+    },
+    resolve(value: string): string | null {
+      if (!connected) {
+        return null;
+      }
+      if (generation !== identityAvatarGeneration) {
+        clearRoutes();
+        generation = identityAvatarGeneration;
+      }
+      activeRoutes?.add(value);
+      const result = value.startsWith("/") ? resolveAvatarImageUrl(value) : value;
+      const cached = routes.get(value);
+      if (cached && cached.result === result) {
+        return cached.url;
+      }
+      const route: { url: string | null; result: typeof result; release?: () => void } = {
+        // Keep the configured source visible until the shared fetch settles.
+        url: value,
+        result,
+        release: retainAvatarImageUrl(result),
+      };
+      routes.set(value, route);
+      const apply = (url: string | null) => {
+        if (generation !== identityAvatarGeneration || routes.get(value) !== route) {
+          route.release?.();
+          return;
+        }
+        route.url = url;
+      };
+      if (typeof result === "string" || result === null) {
+        apply(result);
+      } else {
+        void result.then((url) => {
+          apply(url);
+          if (connected && routes.get(value) === route) {
+            notify();
+          }
+        });
+      }
+      cached?.release?.();
+      return route.url;
+    },
+  };
+}
+
+export type IdentityAvatars = ReturnType<typeof createIdentityAvatars>;
