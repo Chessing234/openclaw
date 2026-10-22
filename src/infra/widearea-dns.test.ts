@@ -85,8 +85,8 @@ it("renders gateway DNS-SD records", () => {
 });
 
 it("drops a trailing hyphen when a host label is cut to 63 characters", () => {
-  const hostLabel = `${"a".repeat(62)}-${"b".repeat(20)}`;
-  const txt = renderZoneText({ hostLabel, instanceLabel: "gateway" });
+  vi.spyOn(os, "hostname").mockReturnValue(`${"a".repeat(62)}-${"b".repeat(20)}`);
+  const txt = renderZoneText();
   const hostLine = txt.split("\n").find((line) => line.startsWith("a"));
   expect(hostLine).toBe(`${"a".repeat(62)} IN A 100.123.224.76`);
 });
