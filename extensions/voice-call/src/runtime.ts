@@ -1,4 +1,5 @@
 import { listAgentIds } from "openclaw/plugin-sdk/agent-scope-runtime";
+import { resolveDefaultModelForAgent } from "openclaw/plugin-sdk/agent-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { isLoopbackHost } from "openclaw/plugin-sdk/gateway-runtime";
@@ -340,6 +341,7 @@ export async function createVoiceCallRuntime(params: {
           const { provider: agentProvider, model } = resolveVoiceResponseModel({
             voiceConfig: effectiveConfig,
             agentRuntime,
+            configuredModel: resolveDefaultModelForAgent({ cfg, agentId }),
           });
           const thinkLevel =
             effectiveConfig.realtime.consultThinkingLevel ??

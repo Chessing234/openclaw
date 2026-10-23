@@ -68,8 +68,8 @@ function createAgentRuntime(
   );
   const runtime = {
     defaults: {
-      provider: "together",
-      model: "Qwen/Qwen2.5-7B-Instruct-Turbo",
+      provider: "openai",
+      model: "gpt-6-astra",
     },
     resolveAgentDir: (_cfg: OpenClawConfig, agentId: string) => `/tmp/openclaw/agents/${agentId}`,
     resolveAgentWorkspaceDir: (_cfg: OpenClawConfig, agentId: string) =>
@@ -120,7 +120,9 @@ async function runGenerateVoiceResponse(
   const userMessage = params.userMessage ?? "hello there";
   const result = await generateVoiceResponse({
     voiceConfig: voiceConfig(),
-    coreConfig: {},
+    coreConfig: {
+      agents: { defaults: { model: { primary: "together/Qwen/Qwen2.5-7B-Instruct-Turbo" } } },
+    },
     agentRuntime: runtime ?? createAgentRuntime(payloads).runtime,
     callId: "call-123",
     agentId: "main",

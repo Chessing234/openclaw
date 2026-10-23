@@ -25,4 +25,30 @@ describe("resolveVoiceResponseModel", () => {
       model: "gpt-5.4-mini",
     });
   });
+
+  it("uses the call agent's configured model when responseModel is unset", () => {
+    expect(
+      resolveVoiceResponseModel({
+        voiceConfig: normalizeVoiceCallConfig({}),
+        agentRuntime,
+        configuredModel: { provider: "anthropic", model: "claude-opus-5-5" },
+      }),
+    ).toEqual({
+      provider: "anthropic",
+      model: "claude-opus-5-5",
+    });
+  });
+
+  it("keeps a single-segment override on the configured provider", () => {
+    expect(
+      resolveVoiceResponseModel({
+        voiceConfig: normalizeVoiceCallConfig({ responseModel: "opus" }),
+        agentRuntime,
+        configuredModel: { provider: "anthropic", model: "claude-opus-5-5" },
+      }),
+    ).toEqual({
+      provider: "anthropic",
+      model: "opus",
+    });
+  });
 });

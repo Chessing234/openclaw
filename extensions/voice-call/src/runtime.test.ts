@@ -155,7 +155,7 @@ function answeringAgent(text: string) {
 
 function createDefaultConsultRuntime<T>(runEmbeddedAgent: T) {
   return {
-    defaults: { provider: "openai", model: "gpt-5.4" },
+    defaults: { provider: "openai", model: "gpt-6-astra" },
     ...createConsultRuntime(runEmbeddedAgent),
   };
 }
@@ -215,7 +215,13 @@ async function startConsult(
   config: VoiceCallConfig,
   agentRuntime: ReturnType<typeof createConsultRuntime>,
 ) {
-  await createRuntime({ config, agentRuntime: agentRuntime as never });
+  await createRuntime({
+    config,
+    agentRuntime: agentRuntime as never,
+    coreConfig: {
+      agents: { defaults: { model: { primary: "openai/gpt-5.4" } } },
+    },
+  });
   return requireRealtimeConsultToolHandler();
 }
 
