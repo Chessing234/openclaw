@@ -106,6 +106,7 @@ type SlackTestState = {
   socketModeClient?: EventEmitter;
   createSlackStartupAuthClientMock: Mock<SlackStartupAuthClientFactory>;
   dispatches: Set<{ controller: AbortController; run: Promise<void> }>;
+  ingressIdle?: Promise<void>;
 };
 
 // The runner resets this module between files, retiring Bolt clients and their mocks together.
@@ -136,6 +137,7 @@ const { state: slackTestState, transport: slackTestTransport } = vi.hoisted(
       socketModeReceiverArgs: undefined,
       createSlackStartupAuthClientMock: vi.fn(),
       dispatches: new Set(),
+      ingressIdle: undefined,
     },
     transport: {},
   }),
@@ -188,6 +190,7 @@ export async function runSlackHandlerWithDispatch(
   };
   slackTestState.dispatches.add(dispatch);
   try {
+    await slackTestState.ingressIdle;
     await dispatch.run;
   } finally {
     slackTestState.dispatches.delete(dispatch);
@@ -308,6 +311,10 @@ export function startSlackMonitor(
   },
 ) {
   const controller = new AbortController();
+  let markIngressIdle = () => {};
+  slackTestState.ingressIdle = new Promise<void>((resolve) => {
+    markIngressIdle = resolve;
+  });
   const run = monitorSlackProvider({
     scheduler: createTestPluginServiceScheduler(),
     botToken: opts?.botToken ?? "bot-token",
@@ -317,7 +324,11 @@ export function startSlackMonitor(
     channelRuntime: opts?.channelRuntime,
     runtime: opts?.runtime,
     setStatus: opts?.setStatus,
+    onDurableIngress: (ingress) => {
+      void ingress.waitForIdle().then(markIngressIdle, markIngressIdle);
+    },
   });
+  void run.then(markIngressIdle, markIngressIdle);
   return { controller, run };
 }
 
