@@ -35,6 +35,7 @@ type SlackProviderMonitor = (params: {
   channelRuntime?: ChannelRuntimeSurface;
   runtime?: RuntimeEnv;
   setStatus?: (next: Record<string, unknown>) => void;
+  onDurableIngress?: (ingress: { waitForIdle: () => Promise<void> }) => void;
 }) => Promise<unknown>;
 type SlackStartupAuthClientFactory = typeof import("./client.js").createSlackStartupAuthClient;
 
@@ -183,6 +184,9 @@ export async function runSlackHandlerWithDispatch(
   handler: SlackHandler,
   args: unknown,
 ): Promise<void> {
+  // Ingress can still be reading state when the Bolt handler is registered.
+  // Starting the handler first lets that read begin under the startup lease.
+  await slackTestState.ingressIdle;
   const controller = new AbortController();
   const dispatch = {
     controller,
@@ -190,7 +194,6 @@ export async function runSlackHandlerWithDispatch(
   };
   slackTestState.dispatches.add(dispatch);
   try {
-    await slackTestState.ingressIdle;
     await dispatch.run;
   } finally {
     slackTestState.dispatches.delete(dispatch);
