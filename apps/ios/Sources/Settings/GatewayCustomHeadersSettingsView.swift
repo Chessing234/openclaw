@@ -48,8 +48,8 @@ struct GatewayCustomHeadersSettingsView: View {
             Section {
                 TextField(
                     text: self.$newName,
-                    prompt: Text("e.g. CF-Access-Client-Id").font(OpenClawType.subhead)
-                ) {
+                    prompt: Text("e.g. CF-Access-Client-Id").font(OpenClawType.subhead))
+                {
                     Text("Header name")
                         .font(OpenClawType.subhead)
                 }
@@ -123,15 +123,13 @@ struct GatewayCustomHeadersSettingsView: View {
         // swiftlint:disable line_length
         if GatewayCustomHeaderNames.credential(named: self.trimmedNewName) == .clientId {
             return String(
-                localized: "This looks like a Cloudflare Access Client ID. Put it in Header value and enter CF-Access-Client-Id as Header name."
-            )
+                localized: "This looks like a Cloudflare Access Client ID. Put it in Header value and enter CF-Access-Client-Id as Header name.")
         }
         if GatewayCustomHeaderNames.credential(named: self.trimmedNewName) == .secret {
             return String(localized: "This looks like a secret. Put it in Header value, not Header name.")
         }
         return String(
-            localized: "Sent only over secure connections. For a Cloudflare Access service token, add two headers: Header name CF-Access-Client-Id with your Client ID as Header value, then Header name CF-Access-Client-Secret with your Client Secret as Header value."
-        )
+            localized: "Sent only over secure connections. For a Cloudflare Access service token, add two headers: Header name CF-Access-Client-Id with your Client ID as Header value, then Header name CF-Access-Client-Secret with your Client Secret as Header value.")
         // swiftlint:enable line_length
     }
 

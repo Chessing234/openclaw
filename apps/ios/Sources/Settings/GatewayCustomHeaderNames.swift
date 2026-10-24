@@ -7,7 +7,9 @@ enum GatewayCustomHeaderCredential: Equatable {
 }
 
 enum GatewayCustomHeaderNames {
-    private static let clientId = try? NSRegularExpression(pattern: "^[0-9a-f]{32}\\.access$", options: [.caseInsensitive])
+    private static let clientId = try? NSRegularExpression(
+        pattern: "^[0-9a-f]{32}\\.access$",
+        options: [.caseInsensitive])
     private static let legacySecret = try? NSRegularExpression(pattern: "^[0-9a-f]{64}$", options: [.caseInsensitive])
     private static let copiedPunctuation = CharacterSet(charactersIn: "\"'`.")
 
@@ -15,7 +17,7 @@ enum GatewayCustomHeaderNames {
     static func credential(named name: String) -> GatewayCustomHeaderCredential? {
         let trimmed = name
             .trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: copiedPunctuation)
+            .trimmingCharacters(in: self.copiedPunctuation)
         if Self.matches(Self.clientId, trimmed) {
             return .clientId
         }
@@ -32,7 +34,7 @@ enum GatewayCustomHeaderNames {
     }
 
     static func displayName(for name: String) -> String {
-        switch credential(named: name) {
+        switch self.credential(named: name) {
         case .clientId:
             String(localized: "Client ID saved as a header name")
         case .secret:
